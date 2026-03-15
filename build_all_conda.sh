@@ -9,6 +9,6 @@ make -j$(nproc)
 # Install mycuda
 cd ${PROJ_ROOT}/bundlesdf/mycuda && \
 rm -rf build *egg* *.so && \
-python -m pip install -e .
+python -m pip install --no-build-isolation -e .
 
 cd ${PROJ_ROOT}

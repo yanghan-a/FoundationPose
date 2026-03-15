@@ -147,10 +147,11 @@ class PoseRefinePredictor:
 
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5):
+  def predict(self, rgb, depth, K, ob_in_cams, xyz_map, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, iteration=5, profiler=None):
     '''
     @rgb: np array (H,W,3)
     @ob_in_cams: np array (N,4,4)
+    @profiler: optional FrameProfiler for fine-grained timing
     '''
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     logging.info(f'ob_in_cams:{ob_in_cams.shape}')
@@ -180,17 +181,21 @@ class PoseRefinePredictor:
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3)
 
     for _ in range(iteration):
+      if profiler: profiler.tick('refiner_crop_render')
       logging.info("making cropped data")
       pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       B_in_cams = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
+        if profiler: profiler.tick('refiner_data_concat')
         A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
         B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
+        if profiler: profiler.tick('refiner_nn_forward')
         logging.info("forward start")
         with torch.cuda.amp.autocast(enabled=self.amp):
           output = self.model(A,B)
         for k in output:
           output[k] = output[k].float()
+        if profiler: profiler.tick('refiner_pose_update')
         logging.info("forward done")
         if self.cfg['trans_rep']=='tracknet':
           if not self.cfg['normalize_xyz']:
@@ -234,7 +239,6 @@ class PoseRefinePredictor:
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
-    torch.cuda.empty_cache()
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
 

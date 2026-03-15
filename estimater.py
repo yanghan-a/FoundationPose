@@ -80,9 +80,11 @@ class FoundationPose:
 
 
   def get_tf_to_centered_mesh(self):
-    tf_to_center = torch.eye(4, dtype=torch.float, device='cuda')
-    tf_to_center[:3,3] = -torch.as_tensor(self.model_center, device='cuda', dtype=torch.float)
-    return tf_to_center
+    if not hasattr(self, '_tf_to_centered_mesh_cache'):
+      tf_to_center = torch.eye(4, dtype=torch.float, device='cuda')
+      tf_to_center[:3,3] = -torch.as_tensor(self.model_center, device='cuda', dtype=torch.float)
+      self._tf_to_centered_mesh_cache = tf_to_center
+    return self._tf_to_centered_mesh_cache
 
 
   def to_device(self, s='cuda:0'):
@@ -247,24 +249,37 @@ class FoundationPose:
     return -torch.ones(len(poses), device='cuda', dtype=torch.float)
 
 
-  def track_one(self, rgb, depth, K, iteration, extra={}):
+  def track_one(self, rgb, depth, K, iteration, extra={}, profiler=None):
     if self.pose_last is None:
       logging.info("Please init pose by register first")
       raise RuntimeError
     logging.info("Welcome")
 
+    if profiler: profiler.tick('depth_to_gpu')
     depth = torch.as_tensor(depth, device='cuda', dtype=torch.float)
+    if profiler: profiler.tick('erode_depth')
     depth = erode_depth(depth, radius=2, device='cuda')
+    if profiler: profiler.tick('bilateral_filter')
     depth = bilateral_filter_depth(depth, radius=2, device='cuda')
     logging.info("depth processing done")
 
-    xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
+    if profiler: profiler.tick('depth2xyzmap')
+    # Cache K tensor on GPU to avoid repeated CPU→GPU transfer
+    if not hasattr(self, '_K_cached') or self._K_cached_np is not K:
+      self._K_cached = torch.as_tensor(K, dtype=torch.float, device='cuda')
+      self._K_cached_np = K
+    xyz_map = depth2xyzmap_batch(depth[None], self._K_cached[None], zfar=np.inf)[0]
 
-    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
+    if profiler: profiler.tick('refiner_predict')
+    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2, profiler=profiler)
     logging.info("pose done")
     if self.debug>=2:
       extra['vis'] = vis
     self.pose_last = pose
-    return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
+
+    if profiler: profiler.tick('pose_to_cpu')
+    result = (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
+    if profiler: profiler.tock('pose_to_cpu')
+    return result
 
 
