@@ -11,6 +11,8 @@ FoundationPose tracking on cube55 with Intel RealSense.
   python run_track_cube55.py
   python run_track_cube55.py --debug 3 --cam_width 640 --cam_height 480 --cam_fps 60
 
+  python run_track_cube55.py --debug 1 --cam_width 640 --cam_height 480 --cam_fps 90 --color_exposure 8000 --depth_exposure 8000
+
 按键:
   q  退出
   r  重新框选 (触发 re-register)
