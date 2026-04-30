@@ -86,8 +86,18 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0,3,1,2)  #(B,3,H,W)
   logging.info("render done")
 
-  rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
-  depthBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(depth, dtype=torch.float, device='cuda')[None,None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
+  # Process in chunks to avoid CUDA OOM on low-VRAM GPUs
+  warp_chunk = 64
+  rgb_gpu = torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None]
+  depth_gpu = torch.as_tensor(depth, dtype=torch.float, device='cuda')[None,None]
+  rgbBs_chunks = []
+  depthBs_chunks = []
+  for wb in range(0, B, warp_chunk):
+    we = min(wb + warp_chunk, B)
+    rgbBs_chunks.append(kornia.geometry.transform.warp_perspective(rgb_gpu.expand(we-wb,-1,-1,-1), tf_to_crops[wb:we], dsize=render_size, mode='bilinear', align_corners=False))
+    depthBs_chunks.append(kornia.geometry.transform.warp_perspective(depth_gpu.expand(we-wb,-1,-1,-1), tf_to_crops[wb:we], dsize=render_size, mode='nearest', align_corners=False))
+  rgbBs = torch.cat(rgbBs_chunks, dim=0)
+  depthBs = torch.cat(depthBs_chunks, dim=0)
   if rgb_rs.shape[-2:]!=cfg['input_resize']:
     rgbAs = kornia.geometry.transform.warp_perspective(rgb_rs, tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
     depthAs = kornia.geometry.transform.warp_perspective(depth_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)

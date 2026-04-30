@@ -1,16 +1,20 @@
 """
-FoundationPose 实时 6DoF 跟踪脚本 (Intel RealSense D435i)
+FoundationPose 实时 6DoF 跟踪脚本 — 固定区域自动框选模式 (Intel RealSense D435i)
+
+与 run_live.py 功能相同，但使用固定位置矩形框自动生成 mask，无需手动鼠标框选。
+适用于相机固定、方块在视野中位置大致固定的场景。
+通过 --box_cx/--box_cy/--box_w/--box_h 参数调节框选区域的中心和大小。
 
 用法:
-  python run_live.py --mesh_file <path_to_mesh.obj> [选项]
+  python run_live_auto.py --mesh_file <path_to_mesh.obj> [选项]
 
 参数:
   --mesh_file           物体 mesh 文件路径 (.obj/.ply)
   --est_refine_iter     初始位姿估计的 refine 迭代次数 (默认 5)
-  --track_refine_iter   跟踪时的 refine 迭代次数 (默认 1, 越小越快)
-  --cam_width           相机分辨率宽 (默认 424, 低分辨率=高帧率)
-  --cam_height          相机分辨率高 (默认 240)
-  --cam_fps             相机帧率 (默认 60, D435i 支持 60@424x240)
+  --track_refine_iter   跟踪时的 refine 迭代次数 (默认 2)
+  --cam_width           相机分辨率宽 (默认 640)
+  --cam_height          相机分辨率高 (默认 480)
+  --cam_fps             相机帧率 (默认 60)
   --motion_predict      启用运动模型预测 (默认开启)
   --no_motion_predict   关闭运动模型预测
   --exposure            手动曝光值 (微秒, 如 100/200/500, 不传则自动曝光)
@@ -22,6 +26,16 @@ FoundationPose 实时 6DoF 跟踪脚本 (Intel RealSense D435i)
   --world_tag_size      AprilTag 物理尺寸 (米, 默认 0.048)
   --world_sample_frames 世界坐标系采样帧数 (默认 100)
   --no_world_frame      跳过世界坐标系标定, 直接发布相机坐标系下的 pose
+  --box_cx              固定框中心 x 比例 (0~1, 0.5=居中, 默认 0.5)
+  --box_cy              固定框中心 y 比例 (0~1, 0.5=居中, 默认 0.5)
+  --box_w               固定框宽度占图像宽度比例 (0~1, 默认 0.3)
+  --box_h               固定框高度占图像高度比例 (0~1, 默认 0.3)
+
+固定区域框选:
+  启动后在图像指定位置生成固定大小的矩形 mask, 无需任何图像分割。
+  遮挡恢复后优先用 last_good_pose 投影区域 auto re-register,
+  若失败则回退到固定区域框选。
+  按 'r' 键可触发重新 register (使用固定区域)。
 
 ZMQ发布 (与 cube_world_observer.py 兼容):
   默认端口 5555, JSON 格式:
@@ -31,49 +45,21 @@ ZMQ发布 (与 cube_world_observer.py 兼容):
   默认通过 AprilTag 标定世界坐标系, 与 cube_world_observer.py 行为一致
   按 'w' 键可重新标定世界坐标系
 
-颜色-坐标轴绑定 (自动校正 + 右手系):
+对称性消歧 (固定摆放模式):
   立方体有 24 重旋转对称性, FoundationPose register 会随机落入任一等价解。
-  register 后自动枚举 24 个对称旋转候选, 通过图像像素颜色匹配 (HSV 色相距离)
-  选出与物理方块颜色朝向一致的 pose (由 CubeColorCorrector 实现)。
-  校正后坐标轴绑定: +X=红色面, +Y=蓝色面(-Y=绿色面), +Z=白色面
-  仅在 register 时做一次校正, track 阶段保持 register 确定的朝向。
-  可视化箭头颜色: X=红色, Y=蓝色, Z=白色
-  箭头端点附带 X/Y/Z 文字标注
-  屏幕实时显示位置 (x,y,z 米) 和欧拉角 (rx,ry,rz 度)
-  世界坐标系标定完成后, 显示和发布的位姿均为世界坐标系下 (标注 "world"); 未标定时为相机坐标系 (标注 "cam")
-
-AprilTag 坐标轴可视化:
-  每帧检测画面中的 AprilTag, 绘制 tag 边框 (绿色) 和 ID 标注,
-  并在 tag 中心画出 XYZ 坐标轴箭头 (X=红, Y=绿, Z=蓝), 轴长等于 tag 尺寸
-  坐标轴已应用 WORLD_FRAME_CORRECTION, 与 cube_world_observer.py 的世界坐标系一致
-
-Register 结果校验:
-  register 输出 pose 后, 立即检查投影尺寸和深度是否与 mesh 一致。
-  若不一致 (锁定了错误目标), 拒绝该 pose 并提示重新手动框选。
-
-等待清场机制:
-  自动 re-register 前固定等待 2 秒, 让遮挡物 (如手) 移开后再抓帧。
-  画面显示 "Waiting for clear view..." 倒计时。按 'r' 可跳过等待直接手动框选。
-
-丢失恢复机制 (三阶段):
-  每帧检测位姿跳变 (平移突变>阈值 / 旋转>45° / z超范围):
-    - 阶段1 (<=90帧, ~3秒): 回退到 last_good_pose 持续重试, 等待遮挡结束
-      物体大概率没动, 遮挡结束后 track_one 从 last_good_pose 自然恢复
-    - 阶段2 (90~300帧): 继续等待, 仍保持 last_good_pose 不被覆盖
-    - 阶段3 (>300帧, ~10秒): 判定物体被移走, 用 last_good_pose 投影生成
-      auto_mask 做 re-register; 若失败则弹出手动框选
-  关键: 遮挡期间绝不触发 re-register, 避免覆盖 last_good_pose
+  register 后自动枚举 24 个对称旋转候选, 选出世界坐标系下四元数与 identity
+  [1,0,0,0] 最接近的 pose。适用于每次固定摆放方块的场景 (不依赖颜色匹配)。
 
 示例:
-  # 默认配置 (424x240@60fps, ~30Hz tracking)
-  python run_live.py --mesh_file demo_data/cube59/mesh/textured_simple.obj
+  # 默认配置 (640x480@60fps, 框在图像中央, 宽高各 30%)
+  python run_live_auto.py --mesh_file demo_data/cube59/mesh/textured_simple.obj
 
-  # 高分辨率 (640x480, ~20Hz)
-  python run_live.py --mesh_file demo_data/cube59/mesh/textured_simple.obj \\
-      --cam_width 640 --cam_height 480 --cam_fps 30
+  # 调整框选区域 (偏左上, 更大的框)
+  python run_live_auto.py --mesh_file demo_data/cube59/mesh/textured_simple.obj \\
+      --box_cx 0.4 --box_cy 0.4 --box_w 0.5 --box_h 0.5
 
   # 关闭运动预测
-  python run_live.py --mesh_file demo_data/cube59/mesh/textured_simple.obj \\
+  python run_live_auto.py --mesh_file demo_data/cube59/mesh/textured_simple.obj \\
       --no_motion_predict
 """
 
@@ -84,15 +70,68 @@ import json
 import time
 import threading
 from collections import defaultdict
+from typing import Optional
 import zmq
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation
-from cube_color_corrector import CubeColorCorrector
+from cube_color_corrector import generate_cube_rotations
 
 try:
     from pupil_apriltags import Detector as AprilTagDetector
 except ImportError:
     AprilTagDetector = None
+
+
+class FixedBoxSelector:
+    """固定区域框选: 在图像指定位置生成固定大小的矩形 mask.
+
+    相机固定后方块在视野中的位置也固定, 无需任何图像分割处理,
+    直接在预设位置生成矩形 mask 用于 FoundationPose register.
+
+    通过命令行参数 --box_cx, --box_cy, --box_w, --box_h 调节位置和大小.
+    默认值为图像中央, 宽高各占图像的 30%.
+    """
+
+    def __init__(self, cx_ratio=0.5, cy_ratio=0.5, w_ratio=0.3, h_ratio=0.3, debug=False):
+        """
+        Args:
+            cx_ratio: 框中心 x 占图像宽度的比例 (0~1, 0.5=居中)
+            cy_ratio: 框中心 y 占图像高度的比例 (0~1, 0.5=居中)
+            w_ratio:  框宽度占图像宽度的比例 (0~1)
+            h_ratio:  框高度占图像高度的比例 (0~1)
+            debug:    是否在画面上显示框选区域
+        """
+        self.cx_ratio = cx_ratio
+        self.cy_ratio = cy_ratio
+        self.w_ratio = w_ratio
+        self.h_ratio = h_ratio
+        self.debug = debug
+
+    def segment(self, image_rgb, depth=None) -> np.ndarray:
+        """生成固定位置的矩形 mask.
+
+        Args:
+            image_rgb: HxWx3 RGB uint8 图像 (仅用于获取尺寸)
+            depth: 未使用, 保留接口兼容性
+
+        Returns:
+            bool mask (H,W), 始终返回有效 mask (不会返回 None)
+        """
+        H, W = image_rgb.shape[:2]
+
+        cx = int(W * self.cx_ratio)
+        cy = int(H * self.cy_ratio)
+        bw = int(W * self.w_ratio)
+        bh = int(H * self.h_ratio)
+
+        x1 = max(0, cx - bw // 2)
+        y1 = max(0, cy - bh // 2)
+        x2 = min(W, cx + bw // 2)
+        y2 = min(H, cy + bh // 2)
+
+        mask = np.zeros((H, W), dtype=bool)
+        mask[y1:y2, x1:x2] = True
+        return mask
 
 
 class FrameProfiler:
@@ -269,64 +308,6 @@ class RealSenseCamera:
         self.pipeline.stop()
 
 
-class BBoxSelector:
-    """鼠标框选工具"""
-
-    def __init__(self):
-        self.start_point = None
-        self.end_point = None
-        self.selecting = False
-        self.done = False
-
-    def mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.start_point = (x, y)
-            self.selecting = True
-            self.done = False
-        elif event == cv2.EVENT_MOUSEMOVE and self.selecting:
-            self.end_point = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.end_point = (x, y)
-            self.selecting = False
-            self.done = True
-
-    def select(self, image):
-        self.start_point = None
-        self.end_point = None
-        self.selecting = False
-        self.done = False
-
-        win_name = "Draw box around object, press ENTER to confirm"
-        cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
-        cv2.setMouseCallback(win_name, self.mouse_callback)
-
-        display = image[..., ::-1].copy()
-
-        while True:
-            show = display.copy()
-            if self.start_point and self.end_point:
-                cv2.rectangle(show, self.start_point, self.end_point, (0, 255, 0), 2)
-            cv2.imshow(win_name, show)
-            key = cv2.waitKey(30) & 0xFF
-            if key == 13 and self.done:
-                break
-            if key == 27:
-                cv2.destroyWindow(win_name)
-                return None
-
-        cv2.destroyWindow(win_name)
-
-        x1 = min(self.start_point[0], self.end_point[0])
-        y1 = min(self.start_point[1], self.end_point[1])
-        x2 = max(self.start_point[0], self.end_point[0])
-        y2 = max(self.start_point[1], self.end_point[1])
-
-        H, W = image.shape[:2]
-        mask = np.zeros((H, W), dtype=np.uint8)
-        mask[y1:y2, x1:x2] = 1
-        return mask.astype(bool)
-
-
 class FPSCounter:
     def __init__(self, window=30):
         self.window = window
@@ -379,8 +360,6 @@ class WorldFrameCalibrator:
             quad_sigma=0.0, decode_sharpening=0.25,
         )
 
-        # world_pose = (R, t): R 的列向量是世界坐标轴在相机坐标系下的方向,
-        # t 是世界原点在相机坐标系下的位置
         self.world_pose = None
         self.is_fixed = False
         self._samples_R = []
@@ -422,7 +401,6 @@ class WorldFrameCalibrator:
             print(f"[World Sampling] Failed: only {len(self._samples_R)} samples")
             return False
 
-        # 平均旋转 (四元数平均)
         quats = []
         for R in self._samples_R:
             q = Rotation.from_matrix(R).as_quat()
@@ -435,10 +413,8 @@ class WorldFrameCalibrator:
         avg_quat /= np.linalg.norm(avg_quat)
         avg_R = Rotation.from_quat(avg_quat).as_matrix()
 
-        # 平均平移
         avg_t = np.mean(self._samples_t, axis=0)
 
-        # 应用世界坐标系修正
         if self.world_frame_correction is not None:
             correction_R = np.array(self.world_frame_correction)
             avg_R = avg_R @ correction_R.T
@@ -458,21 +434,11 @@ class WorldFrameCalibrator:
         print(f"[World Sampling] Reset. Collecting {self.sample_target} frames...")
 
     def cam_to_world(self, pose_4x4):
-        """将相机坐标系下的 4x4 pose 转换到世界坐标系。
-
-        Args:
-            pose_4x4: 4x4 物体在相机坐标系下的位姿矩阵
-
-        Returns:
-            (R_world, t_world): 物体在世界坐标系下的旋转和平移,
-            如果世界坐标系未标定则返回 (None, None)
-        """
+        """将相机坐标系下的 4x4 pose 转换到世界坐标系。"""
         if self.world_pose is None:
             return None, None
 
         R_world_cam, t_world_cam = self.world_pose
-        # R_world_cam 列向量是世界轴在相机系下的表示
-        # R_cam_world = R_world_cam.T 将相机系下的向量转到世界系
         R_cam_world = R_world_cam.T
         t_cam_world = -R_cam_world @ t_world_cam
 
@@ -511,29 +477,11 @@ def make_mask_from_pose(pose_4x4, mesh_pts, K, H, W, pad_ratio=0.5):
 
 def check_pose_size_consistency(pose_4x4, mesh_diameter, K, depth_map, mesh_pts,
                                  size_tol=0.5, depth_tol=0.4):
-    """检查 pose 投影尺寸是否与目标物体一致。
-
-    原理: 已知 mesh 直径 d 和估计深度 z, 预期投影像素尺寸 ≈ d * f / z。
-    将实际投影 bbox 尺寸与预期比较, 偏差过大说明 tracker 锁定了错误目标。
-    同时检查 bbox 区域内的实际深度是否与 pose z 一致。
-
-    Args:
-        pose_4x4: 4x4 位姿矩阵
-        mesh_diameter: 物体直径 (米)
-        K: 3x3 相机内参
-        depth_map: 深度图 (H,W), 米
-        mesh_pts: mesh 顶点 (N,3)
-        size_tol: 尺寸偏差容忍度, 实际/预期比值在 [1-tol, 1+tol] 内为合格
-        depth_tol: 深度偏差容忍度 (相对比例)
-
-    Returns:
-        (is_valid, reason): bool 和原因字符串
-    """
+    """检查 pose 投影尺寸是否与目标物体一致。"""
     z = pose_4x4[2, 3]
     if z < 0.01:
         return False, f"z={z:.3f} too small"
 
-    # 投影 mesh 顶点 → 2D bbox
     pts_cam = (pose_4x4[:3, :3] @ mesh_pts.T + pose_4x4[:3, 3:4]).T
     valid = pts_cam[:, 2] > 0.01
     if valid.sum() < 10:
@@ -546,7 +494,6 @@ def check_pose_size_consistency(pose_4x4, mesh_diameter, K, depth_map, mesh_pts,
     bbox_h = uvs[:, 1].max() - uvs[:, 1].min()
     actual_size = max(bbox_w, bbox_h)
 
-    # 预期投影尺寸
     f = (K[0, 0] + K[1, 1]) / 2.0
     expected_size = mesh_diameter * f / z
 
@@ -554,7 +501,6 @@ def check_pose_size_consistency(pose_4x4, mesh_diameter, K, depth_map, mesh_pts,
     if ratio < (1 - size_tol) or ratio > (1 + size_tol):
         return False, f"size mismatch: actual={actual_size:.0f}px, expected={expected_size:.0f}px, ratio={ratio:.2f}"
 
-    # 检查 bbox 区域内深度是否与 pose z 一致
     H, W = depth_map.shape[:2]
     u_min = max(0, int(uvs[:, 0].min()))
     u_max = min(W, int(uvs[:, 0].max()))
@@ -570,6 +516,80 @@ def check_pose_size_consistency(pose_4x4, mesh_diameter, K, depth_map, mesh_pts,
                 return False, f"depth mismatch: pose_z={z:.3f}m, roi_median={median_depth:.3f}m, ratio={depth_ratio:.2f}"
 
     return True, "ok"
+
+
+def select_symmetric_closest_to_identity(
+    pose, tf_to_centered_mesh, rotations_3x3, rotations_4x4,
+    world_calibrator=None, R_color_correction=None, debug=False,
+):
+    """从 24 个对称旋转候选中, 选出 **世界坐标系** 下四元数最接近 identity 的 pose.
+
+    必须在世界坐标系标定完成后调用, 否则返回 (None, None).
+    相机坐标系下做 identity 比较没有物理意义.
+
+    适用于每次固定摆放方块的场景: 方块初始姿态在世界坐标系下接近 identity.
+
+    Args:
+        pose:                 4x4 register 返回的 original-mesh pose (相机坐标系)
+        tf_to_centered_mesh:  4x4 est.get_tf_to_centered_mesh() 结果
+        rotations_3x3:        list of 24 个 3x3 旋转矩阵
+        rotations_4x4:        list of 24 个 4x4 旋转矩阵
+        world_calibrator:     WorldFrameCalibrator 实例 (必须已标定)
+        R_color_correction:   4x4 颜色-轴修正矩阵 (或 None → identity)
+        debug:                是否打印调试信息
+
+    Returns:
+        (corrected_pose, corrected_centered)  或  (None, None) 若世界坐标系未就绪
+    """
+    # ---- 必须在世界坐标系下比较 ----
+    if world_calibrator is None or not world_calibrator.is_fixed:
+        if debug:
+            print("[IdentityMatch] World frame not ready, skipping symmetry correction")
+        return None, None
+
+    tf_inv = np.linalg.inv(tf_to_centered_mesh)
+    centered_pose = pose @ tf_inv
+
+    if R_color_correction is None:
+        R_color_correction = np.eye(4)
+
+    best_dist = np.inf
+    best_idx = 0
+    dists = []
+
+    for idx, R4 in enumerate(rotations_4x4):
+        candidate_centered = centered_pose @ R4
+        candidate_pose = candidate_centered @ tf_to_centered_mesh
+        candidate_corrected = candidate_pose @ R_color_correction
+
+        R_world, _ = world_calibrator.cam_to_world(candidate_corrected)
+
+        # scipy quat: (x, y, z, w)  → identity = (0, 0, 0, 1)
+        quat = Rotation.from_matrix(R_world).as_quat()
+        w = quat[3]
+        dist = 2.0 * np.arccos(np.clip(abs(w), 0.0, 1.0))
+        dists.append(dist)
+
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+
+    R_sym_4x4 = rotations_4x4[best_idx]
+    corrected_centered = centered_pose @ R_sym_4x4
+    corrected_pose = corrected_centered @ tf_to_centered_mesh
+
+    if debug:
+        sorted_dists = sorted(enumerate(dists), key=lambda x: x[1])
+        print(f"[IdentityMatch] frame=world, best idx={best_idx}, "
+              f"dist={np.rad2deg(best_dist):.1f}°")
+        print(f"  Top-3: "
+              f"#{sorted_dists[0][0]}={np.rad2deg(sorted_dists[0][1]):.1f}°, "
+              f"#{sorted_dists[1][0]}={np.rad2deg(sorted_dists[1][1]):.1f}°, "
+              f"#{sorted_dists[2][0]}={np.rad2deg(sorted_dists[2][1]):.1f}°")
+        is_identity = np.allclose(rotations_3x3[best_idx], np.eye(3))
+        print(f"  Identity rotation (no change): {is_identity}")
+
+    return corrected_pose, corrected_centered
 
 
 if __name__ == '__main__':
@@ -599,6 +619,14 @@ if __name__ == '__main__':
                         help='Frames to sample for world frame averaging (default 100)')
     parser.add_argument('--no_world_frame', action='store_true',
                         help='Skip world frame calibration, publish in camera frame')
+    parser.add_argument('--box_cx', type=float, default=0.4,
+                        help='固定框中心 x 比例 (0~1, 0.5=居中)')
+    parser.add_argument('--box_cy', type=float, default=0.5,
+                        help='固定框中心 y 比例 (0~1, 0.5=居中)')
+    parser.add_argument('--box_w', type=float, default=0.35,
+                        help='固定框宽度占图像宽度比例 (0~1)')
+    parser.add_argument('--box_h', type=float, default=0.35,
+                        help='固定框高度占图像高度比例 (0~1)')
     args = parser.parse_args()
 
     set_logging_format()
@@ -614,17 +642,7 @@ if __name__ == '__main__':
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
     inv_to_origin = np.linalg.inv(to_origin)  # 预计算，避免每帧重复求逆
 
-    # 颜色-坐标轴修正: mesh 原始轴 → 物理方块颜色轴 (右手系)
-    # mesh 原始 (贴图交换蓝绿后): +X=Blue, +Y=White, +Z=Red
-    # 目标:      +X=Red,   +Y=Blue,  +Z=White (对面: -X=Orange, -Y=Green, -Z=Yellow)
-    # 用法: corrected_pose = pose @ R_color_correction
-    # R 的列向量 = 新坐标轴在 mesh 坐标系中的方向
     R_color_correction = np.eye(4)
-    # R_color_correction[:3, :3] = np.array([
-    #     [0, 1, 0],   # col0: new +X(Red)   = mesh +Z → [0,0,1] read col-wise
-    #     [0, 0, 1],   # col1: new +Y(Green) = mesh +X → [1,0,0] read col-wise
-    #     [1, 0, 0],   # col2: new +Z(White) = mesh +Y → [0,1,0] read col-wise
-    # ])
     logging.info(f"Color-axis correction: Red=+X, Blue=+Y(-Y=Green), White=+Z")
 
     scorer = ScorePredictor()
@@ -635,11 +653,20 @@ if __name__ == '__main__':
                          debug_dir=debug_dir, debug=debug, glctx=glctx)
     logging.info("estimator initialization done")
 
-    color_corrector = CubeColorCorrector(half_size=0.0275, debug=(debug >= 1))
+    # 预计算 24 个立方体对称旋转 (用于 identity matching)
+    _sym_rots_3x3 = generate_cube_rotations()
+    _sym_rots_4x4 = []
+    for _R in _sym_rots_3x3:
+        _M = np.eye(4)
+        _M[:3, :3] = _R
+        _sym_rots_4x4.append(_M)
+    logging.info(f"Symmetry disambiguation: closest-to-identity mode (24 candidates)")
 
     cam = RealSenseCamera(width=args.cam_width, height=args.cam_height, fps=args.cam_fps,
                           exposure=args.exposure)
-    selector = BBoxSelector()
+    auto_seg = FixedBoxSelector(cx_ratio=args.box_cx, cy_ratio=args.box_cy,
+                                w_ratio=args.box_w, h_ratio=args.box_h,
+                                debug=(debug >= 1))
     fps_counter = FPSCounter()
     motion = MotionPredictor()
 
@@ -647,8 +674,7 @@ if __name__ == '__main__':
     mesh_diameter = est.diameter
     recovery_thresh = args.recovery_thresh if args.recovery_thresh > 0 else mesh_diameter * 0.5
     mesh_pts_np = np.asarray(mesh.vertices)
-    REVERT_LIMIT = 90       # 回退阶段最多持续帧数 (~3秒@30fps), 等遮挡结束
-    REREGISTER_LIMIT = 300  # 超过此帧数彻底丢失, 触发 re-register
+    REVERT_LIMIT = 5        # 回退阶段最多持续帧数, 连续几帧确认丢失后立即 re-register
 
     # ZMQ publisher for cube pose
     zmq_context = None
@@ -660,7 +686,6 @@ if __name__ == '__main__':
         logging.info(f"ZMQ cube pose publisher on port {args.zmq_port}")
 
     # World frame calibrator (AprilTag)
-    # 与 cube_world_observer.py 中的 WORLD_FRAME_CORRECTION 一致
     WORLD_FRAME_CORRECTION = np.array([
         [ 0.9848,  0.0000,  0.1736],
         [ 0.0000, -1.0000,  0.0000],
@@ -687,8 +712,9 @@ if __name__ == '__main__':
 
     logging.info(f"Motion prediction: {'ON' if args.motion_predict else 'OFF'}")
     logging.info(f"Recovery: thresh={recovery_thresh:.4f}m, diameter={mesh_diameter:.4f}m, "
-                 f"revert={REVERT_LIMIT}f, reregister={REREGISTER_LIMIT}f")
-    logging.info("Controls: 'r' = re-select, 'w' = re-calibrate world, 'q' = quit, 'p' = profiling")
+                 f"revert={REVERT_LIMIT}f (then immediate re-register)")
+    logging.info("Controls: 'r' = auto re-register, 'w' = re-calibrate world, 'q' = quit, 'p' = profiling")
+    logging.info("Auto mode: parallelogram detection for cube detection (no manual selection)")
 
     # 初始化完成后压制日志 (每帧 ~15 次 logging.info 严重影响性能)
     logging.getLogger().setLevel(logging.WARNING)
@@ -718,7 +744,7 @@ if __name__ == '__main__':
                         if last_good_pose is not None:
                             center_pose = last_good_pose @ inv_to_origin
                             draw_posed_3d_box(cam.K, img=vis_bgr, ob_in_cam=center_pose, bbox=bbox)
-                        cv2.imshow('FoundationPose Live Tracking', vis_bgr)
+                        cv2.imshow('FoundationPose Live Tracking (Auto)', vis_bgr)
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         break
@@ -738,10 +764,9 @@ if __name__ == '__main__':
                     logging.info("Auto re-register from last good pose...")
                     mask = auto_mask
                 else:
-                    logging.info("Select object with mouse, press ENTER to confirm")
-                    mask = selector.select(color)
-                    if mask is None:
-                        continue
+                    # Fallback: 固定区域框选
+                    logging.info("Auto segmentation: using fixed-position box...")
+                    mask = auto_seg.segment(color)
 
                 # register 比 track 显存开销大很多，先释放缓存防 OOM
                 torch.cuda.empty_cache()
@@ -758,14 +783,31 @@ if __name__ == '__main__':
                 if not reg_valid:
                     logging.warning(f"[REGISTER] Pose rejected: {reg_reason}")
                     print(f"[REGISTER] Result doesn't match target size: {reg_reason}")
-                    print(f"[REGISTER] Please re-select the correct object.")
-                    last_good_pose = None  # 强制手动框选
+                    print(f"[REGISTER] Auto retrying...")
+                    last_good_pose = None  # 强制颜色分割重试
                     continue
 
-                # 颜色-轴校正: 从 24 个对称旋转候选中选出颜色匹配最佳的
+                # 对称性消歧: 从 24 个候选中选出世界坐标系下四元数最接近 identity 的
                 tf_centered = est.get_tf_to_centered_mesh().data.cpu().numpy()
-                pose, pose_centered_np = color_corrector.correct(
-                    pose, color, cam.K, tf_centered)
+                corrected_pose, corrected_centered = select_symmetric_closest_to_identity(
+                    pose, tf_centered, _sym_rots_3x3, _sym_rots_4x4,
+                    world_calibrator=world_calibrator,
+                    R_color_correction=R_color_correction,
+                    debug=(debug >= 1),
+                )
+
+                if corrected_pose is not None:
+                    # 世界坐标系已就绪, 对称性校正成功
+                    pose = corrected_pose
+                    pose_centered_np = corrected_centered
+                else:
+                    # 世界坐标系未就绪, 先用原始 pose 跟踪,
+                    # 等世界坐标系标定完成后会自动触发 re-register
+                    logging.info("[REGISTER] World frame not ready, "
+                                 "using raw pose (will re-register after calibration)")
+                    tf_inv = np.linalg.inv(tf_centered)
+                    pose_centered_np = pose @ tf_inv
+
                 est.pose_last = torch.as_tensor(
                     pose_centered_np, device='cuda', dtype=torch.float
                 ).reshape(1, 4, 4)
@@ -807,17 +849,16 @@ if __name__ == '__main__':
                     rot_jump = 0.0
                 jump_bad = (trans_jump > recovery_thresh) or (rot_jump > np.deg2rad(45)) or (z < 0.02) or (z > 3.0)
 
-                # 投影尺寸 + 深度一致性校验: 检测 tracker 是否锁定了错误目标
+                # 投影尺寸 + 深度一致性校验
                 size_valid, size_reason = check_pose_size_consistency(
                     pose, mesh_diameter, cam.K, depth, mesh_pts_np)
 
                 if not size_valid and not jump_bad:
                     # 尺寸不对但跳变检测没触发 = tracker 平滑漂移到了错误目标
-                    # 直接要求手动框选 re-register
                     print(f"[SIZE CHECK] Target mismatch: {size_reason}")
-                    print(f"[SIZE CHECK] Tracker locked on wrong object, manual re-register required")
+                    print(f"[SIZE CHECK] Tracker locked on wrong object, auto re-register...")
                     need_register = True
-                    last_good_pose = None  # 清除, 强制手动框选
+                    last_good_pose = None  # 清除, 强制颜色分割
                     lost_count = 0
                     frame_idx += 1
                     fps_counter.tick()
@@ -831,43 +872,18 @@ if __name__ == '__main__':
                 if is_bad:
                     lost_count += 1
                     if lost_count <= REVERT_LIMIT:
-                        # 阶段1: 回退到上次好的 pose, 等待遮挡结束
-                        # 物体大概率没动, 遮挡结束后 track_one 自然恢复
+                        # 短暂回退确认: 连续几帧都丢失才算真丢
                         if last_good_pose_centered is not None:
                             est.pose_last = last_good_pose_centered.clone().reshape(1, 4, 4)
                         motion.reset()
-                        if lost_count == 1:
-                            print(f"[RECOVERY] Tracking lost, reverting to last good pose (waiting up to {REVERT_LIMIT} frames)...")
-                    elif lost_count <= REREGISTER_LIMIT:
-                        # 阶段2: 回退超时但还没到 re-register 阈值
-                        # 仍然保持 last_good_pose 不变, 继续等
-                        if last_good_pose_centered is not None:
-                            est.pose_last = last_good_pose_centered.clone().reshape(1, 4, 4)
-                        motion.reset()
-                        if lost_count == REVERT_LIMIT + 1:
-                            print(f"[RECOVERY] Still lost after {REVERT_LIMIT} frames, "
-                                  f"waiting up to {REREGISTER_LIMIT} before re-register...")
                     else:
-                        # 阶段3: 彻底丢失 → 手动框选 re-register
-                        print(f"[RECOVERY] Lost for {lost_count} frames, manual re-register required")
+                        # 确认丢失 → 立即 re-register
+                        print(f"[RECOVERY] Lost for {lost_count} frames, auto re-register...")
                         need_register = True
-                        last_good_pose = None  # 清除, 强制手动框选
                         lost_count = 0
 
                     frame_idx += 1
                     fps_counter.tick()
-
-                    # 丢失期间仍然显示画面 (标注 LOST 状态)
-                    if debug >= 1:
-                        vis_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-                        lost_text = f"LOST ({lost_count} frames) - waiting for object"
-                        cv2.putText(vis_bgr, lost_text, (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        if last_good_pose is not None:
-                            center_pose = last_good_pose @ inv_to_origin
-                            draw_posed_3d_box(cam.K, img=vis_bgr, ob_in_cam=center_pose, bbox=bbox)
-                        cv2.imshow('FoundationPose Live Tracking', vis_bgr)
-
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         break
@@ -884,37 +900,36 @@ if __name__ == '__main__':
 
             # World frame calibration (feed every frame until fixed)
             if world_calibrator is not None and not world_calibrator.is_fixed:
-                # RealSense color is RGB, convert to gray for AprilTag
                 gray = cv2.cvtColor(color, cv2.COLOR_RGB2GRAY)
                 just_fixed = world_calibrator.feed_frame(gray)
                 if just_fixed:
                     logging.getLogger().setLevel(logging.INFO)
                     logging.info("World frame calibrated!")
+                    logging.info("Auto re-register to apply symmetry correction in world frame")
                     logging.getLogger().setLevel(logging.WARNING)
+                    need_register = True
+                    continue
 
             # 应用颜色-坐标轴修正
             corrected_pose = pose @ R_color_correction
 
-            # Publish cube pose via ZMQ (same format as cube_world_observer.py)
+            # Publish cube pose via ZMQ
             if zmq_socket is not None:
                 profiler.tick('zmq_publish')
 
-                # Transform to world frame if calibrated (使用修正后的 pose)
                 if world_calibrator is not None and world_calibrator.is_fixed:
                     R_world, t_world = world_calibrator.cam_to_world(corrected_pose)
                     world_fixed = True
                 elif world_calibrator is None:
-                    # --no_world_frame: publish camera-frame pose directly
                     R_world = corrected_pose[:3, :3]
                     t_world = corrected_pose[:3, 3]
                     world_fixed = True
                 else:
-                    # World frame not yet calibrated, publish camera-frame as fallback
                     R_world = corrected_pose[:3, :3]
                     t_world = corrected_pose[:3, 3]
                     world_fixed = False
 
-                quat_xyzw = Rotation.from_matrix(R_world).as_quat()  # (x, y, z, w)
+                quat_xyzw = Rotation.from_matrix(R_world).as_quat()
                 msg = {
                     'timestamp': time.time(),
                     'frame': frame_idx,
@@ -942,19 +957,14 @@ if __name__ == '__main__':
 
             profiler.tick('visualization')
             if debug >= 1:
-                center_pose = corrected_pose @ inv_to_origin  # OBB 变换用于 bbox 绘制
-                # 先转 BGR 一次，后续 draw 直接在 BGR 上 in-place 操作，避免反复转换+copy
+                center_pose = corrected_pose @ inv_to_origin
                 vis_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
                 draw_posed_3d_box(cam.K, img=vis_bgr, ob_in_cam=center_pose, bbox=bbox)
-                # 坐标轴: 用 corrected_pose 的旋转 (颜色-轴绑定), 平移取 center_pose (视觉中心)
-                # inv_to_origin 包含 OBB 旋转会破坏颜色-轴对齐, 所以坐标轴不能用 center_pose
                 axis_pose = corrected_pose.copy()
-                axis_pose[:3, 3] = center_pose[:3, 3]  # 平移用 OBB 中心, 旋转用颜色修正
-                # 坐标轴颜色: X=红(Red), Y=蓝(Blue, 对面绿), Z=白(White)
+                axis_pose[:3, 3] = center_pose[:3, 3]
                 vis_bgr = draw_xyz_axis(vis_bgr, ob_in_cam=axis_pose, scale=0.1,
                               K=cam.K, thickness=3, transparency=0, is_input_rgb=False,
                               axis_colors=((0,0,255), (255,0,0), (255,255,255)))
-                # 在箭头端点附近标注 X/Y/Z 文字
                 _axis_pts = np.array([[0.1,0,0,1],[0,0.1,0,1],[0,0,0.1,1]], dtype=np.float64)
                 _pts_cam = (axis_pose @ _axis_pts.T)[:3, :]
                 _proj = cam.K @ _pts_cam
@@ -962,7 +972,6 @@ if __name__ == '__main__':
                 for _label, _uv, _clr in [("X", _uvs[0], (0,0,255)), ("Y", _uvs[1], (255,0,0)), ("Z", _uvs[2], (255,255,255))]:
                     cv2.putText(vis_bgr, _label, tuple(_uv + [5, -5]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _clr, 2)
 
-                # 提取姿态信息: 位置 + 欧拉角 (世界坐标系优先, 未标定时用相机坐标系)
                 if world_calibrator is not None and world_calibrator.is_fixed:
                     R_world, t_world = world_calibrator.cam_to_world(corrected_pose)
                     pos = t_world
@@ -976,6 +985,7 @@ if __name__ == '__main__':
                 label = f"FPS:{fps_counter.fps:.1f}"
                 if args.motion_predict:
                     label += " +motion"
+                label += " [AUTO]"
                 if world_calibrator is not None:
                     if world_calibrator.is_fixed:
                         label += " W:OK"
@@ -984,11 +994,9 @@ if __name__ == '__main__':
                         label += f" W:{n}/{world_calibrator.sample_target}"
                 cv2.putText(vis_bgr, label, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                # 位置信息
                 pos_text = f"Pos({frame_label}): x={pos[0]:.3f} y={pos[1]:.3f} z={pos[2]:.3f} m"
                 cv2.putText(vis_bgr, pos_text, (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                # 欧拉角信息 (XYZ convention, degrees)
                 rot_text = f"Rot({frame_label}): rx={euler_deg[0]:.1f} ry={euler_deg[1]:.1f} rz={euler_deg[2]:.1f} deg"
                 cv2.putText(vis_bgr, rot_text, (10, 85),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
@@ -1004,26 +1012,21 @@ if __name__ == '__main__':
                         tag_size=args.world_tag_size,
                     ) if world_calibrator is not None else []
                     for det in tag_results:
-                        # 画 tag 边框
                         corners = det.corners.astype(int)
                         for i in range(4):
                             cv2.line(vis_bgr, tuple(corners[i]), tuple(corners[(i+1)%4]),
                                      (0, 255, 0), 2)
-                        # 标注 tag ID
                         ctr = det.center.astype(int)
                         cv2.putText(vis_bgr, f"id:{det.tag_id}", (ctr[0]-20, ctr[1]-15),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                        # 绘制 tag 坐标轴 (XYZ), 应用 WORLD_FRAME_CORRECTION 与 cube_world_observer 对齐
                         if det.pose_R is not None and det.pose_t is not None:
-                            tag_R = det.pose_R @ WORLD_FRAME_CORRECTION.T  # 修正后的世界坐标轴
-                            tag_t = det.pose_t.flatten()  # 3
-                            axis_len = args.world_tag_size * 1.0  # 轴长 = tag 尺寸
-                            # 3D 轴端点 (tag 坐标系原点 + 各轴方向)
+                            tag_R = det.pose_R @ WORLD_FRAME_CORRECTION.T
+                            tag_t = det.pose_t.flatten()
+                            axis_len = args.world_tag_size * 1.0
                             origin = tag_t
                             x_end = tag_t + tag_R[:, 0] * axis_len
                             y_end = tag_t + tag_R[:, 1] * axis_len
                             z_end = tag_t + tag_R[:, 2] * axis_len
-                            # 投影到图像
                             def proj_pt(pt3d):
                                 u = fx * pt3d[0] / pt3d[2] + cx
                                 v = fy * pt3d[1] / pt3d[2] + cy
@@ -1032,9 +1035,9 @@ if __name__ == '__main__':
                             x2d = proj_pt(x_end)
                             y2d = proj_pt(y_end)
                             z2d = proj_pt(z_end)
-                            cv2.arrowedLine(vis_bgr, o2d, x2d, (0, 0, 255), 2, tipLength=0.15)  # X=红
-                            cv2.arrowedLine(vis_bgr, o2d, y2d, (0, 255, 0), 2, tipLength=0.15)  # Y=绿
-                            cv2.arrowedLine(vis_bgr, o2d, z2d, (255, 0, 0), 2, tipLength=0.15)  # Z=蓝
+                            cv2.arrowedLine(vis_bgr, o2d, x2d, (0, 0, 255), 2, tipLength=0.15)
+                            cv2.arrowedLine(vis_bgr, o2d, y2d, (0, 255, 0), 2, tipLength=0.15)
+                            cv2.arrowedLine(vis_bgr, o2d, z2d, (255, 0, 0), 2, tipLength=0.15)
                             cv2.putText(vis_bgr, "X", (x2d[0]+3, x2d[1]-3),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
                             cv2.putText(vis_bgr, "Y", (y2d[0]+3, y2d[1]-3),
@@ -1042,9 +1045,24 @@ if __name__ == '__main__':
                             cv2.putText(vis_bgr, "Z", (z2d[0]+3, z2d[1]-3),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
 
+            # 绘制固定框选区域 (cyan 虚线矩形)
+            if debug >= 1:
+                H_img, W_img = vis_bgr.shape[:2]
+                box_cx = int(W_img * auto_seg.cx_ratio)
+                box_cy = int(H_img * auto_seg.cy_ratio)
+                box_bw = int(W_img * auto_seg.w_ratio)
+                box_bh = int(H_img * auto_seg.h_ratio)
+                box_x1 = max(0, box_cx - box_bw // 2)
+                box_y1 = max(0, box_cy - box_bh // 2)
+                box_x2 = min(W_img, box_cx + box_bw // 2)
+                box_y2 = min(H_img, box_cy + box_bh // 2)
+                cv2.rectangle(vis_bgr, (box_x1, box_y1), (box_x2, box_y2), (255, 255, 0), 1)
+                cv2.putText(vis_bgr, "BOX", (box_x1 + 2, box_y1 + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
             profiler.tick('imshow')
             if debug >= 1:
-                cv2.imshow('FoundationPose Live Tracking', vis_bgr)
+                cv2.imshow('FoundationPose Live Tracking (Auto)', vis_bgr)
 
             if debug >= 2:
                 os.makedirs(f'{debug_dir}/track_vis', exist_ok=True)
@@ -1058,14 +1076,13 @@ if __name__ == '__main__':
             if key == ord('q'):
                 break
             elif key == ord('r'):
+                # 'r' = 触发自动重新分割
                 need_register = True
-                last_good_pose = None
+                last_good_pose = None  # 强制颜色分割
             elif key == ord('w'):
-                # 重新标定世界坐标系
                 if world_calibrator is not None:
                     world_calibrator.reset()
             elif key == ord('p'):
-                # 手动打印 profiling
                 print(f"\n=== Frame Profiling (avg over last {profiler.window} frames) ===")
                 print(profiler.summary_str())
                 print(f"  Tracking FPS: {fps_counter.fps:.1f}")

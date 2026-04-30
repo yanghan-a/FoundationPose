@@ -4,6 +4,11 @@
 FoundationPose 对立方体做 6DoF 姿态估计时，由于 24 重旋转对称性，register 会随机落入
 24 个等价解之一。本模块通过枚举 24 个对称旋转候选，利用相机图像像素颜色匹配选出正确朝向。
 
+颜色匹配使用 Lab 色彩空间欧氏距离 (sigma=25)，相比 HSV 色相距离对 Red/Orange/Yellow
+等相近颜色辨别力提升 3x+（Lab 距离 ~40-50 vs HSV 仅 ~15° hue）。
+白色判定同时检查 L* 和 chroma，避免 Yellow(L*=248) 被误判为 White(L*=255)。
+debug 模式下打印 best 候选和 runner-up 的逐面详情 (采样RGB、期望RGB、Lab距离、score)。
+
 用法:
     from cube_color_corrector import CubeColorCorrector
 
@@ -11,7 +16,7 @@ FoundationPose 对立方体做 6DoF 姿态估计时，由于 24 重旋转对称�
 
     # 在 register 后调用 (仅需一次，track 阶段不需要):
     tf_centered = est.get_tf_to_centered_mesh().data.cpu().numpy()
-    pose, pose_centered = corrector.correct(pose, image_rgb, K, tf_centered)
+    pose, pose_centered = corrector.correct(pose, image_rgb, K, tf_centered, mask=mask)
     est.pose_last = torch.as_tensor(pose_centered, device='cuda', dtype=torch.float).reshape(1, 4, 4)
 
 颜色-轴映射 (与 mesh 贴图一致):
@@ -21,7 +26,8 @@ FoundationPose 对立方体做 6DoF 姿态估计时，由于 24 重旋转对称�
 
 参数:
     half_size     方块半边长 (米), 55mm 方块 = 0.0275
-    patch_radius  采样 patch 半径 (像素), 默认 3 → 7x7 patch
+    patch_radius  每个采样点的 patch 半径 (像素), 默认 3 → 7x7 patch
+                  每个面采 3x3=9 个点, 各点取 7x7 patch 中位数, 再对 9 个点取中位数
     debug         是否打印调试信息
 """
 
@@ -75,7 +81,10 @@ def sample_face_color(image, u, v, patch_radius):
 
 
 def color_match_score(sampled_rgb, expected_rgb):
-    """HSV 色相距离打分, 白色特殊处理.
+    """Lab 色彩空间欧氏距离打分, 白色特殊处理.
+
+    相比 HSV 色相距离, Lab 空间对 Red/Orange/Yellow 等相近颜色辨别力更强:
+    Red-Orange Lab 距离 ~40-50 (vs HSV 仅 ~15° hue).
 
     Args:
         sampled_rgb: (3,) 采样到的 RGB 颜色 (0-255 float)
@@ -84,41 +93,34 @@ def color_match_score(sampled_rgb, expected_rgb):
     Returns:
         float 匹配分数 [0, 1]
     """
-    # Convert to HSV (OpenCV expects uint8 BGR)
-    s_bgr = np.uint8([[sampled_rgb[::-1]]])
-    e_bgr = np.uint8([[expected_rgb[::-1]]])
-    s_hsv = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2HSV)[0, 0].astype(float)
-    e_hsv = cv2.cvtColor(e_bgr, cv2.COLOR_BGR2HSV)[0, 0].astype(float)
+    # RGB → Lab (OpenCV: L 0-255, a/b 0-255, neutral=128)
+    s_bgr = np.uint8([[np.clip(sampled_rgb[::-1], 0, 255)]])
+    e_bgr = np.uint8([[np.clip(expected_rgb[::-1], 0, 255)]])
+    s_lab = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
+    e_lab = cv2.cvtColor(e_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
 
-    s_h, s_s, s_v = s_hsv  # H: 0-180, S: 0-255, V: 0-255
-    e_h, e_s, e_v = e_hsv
-
-    # White detection: expected has very low S and high V
-    is_white_expected = (e_s < 30 and e_v > 200)
-
+    # White detection: expected has very high L* AND low chroma
+    # (Yellow also has L*=248, but chroma~97; White has chroma~0)
+    e_chroma = np.sqrt((e_lab[1] - 128)**2 + (e_lab[2] - 128)**2)
+    is_white_expected = (e_lab[0] > 230) and (e_chroma < 20)
     if is_white_expected:
-        # White face: sampled should have low S and high V
-        # S < 60 (out of 255) and V > 150
-        if s_s < 60 and s_v > 150:
-            # Better score for lower saturation and higher value
-            return 1.0 - s_s / 255.0
-        else:
-            return 0.0
-    else:
-        # Chromatic face: hue Gaussian distance
-        # OpenCV H is 0-180 (half-degree), convert to full degrees for sigma
-        hue_diff = abs(s_h - e_h)
-        hue_diff = min(hue_diff, 180 - hue_diff)  # circular distance in OpenCV units
-        hue_diff_deg = hue_diff * 2.0  # convert to full degrees
+        # Sampled should have high L* and low chroma
+        s_chroma = np.sqrt((s_lab[1] - 128)**2 + (s_lab[2] - 128)**2)
+        if s_lab[0] > 180 and s_chroma < 40:
+            return 1.0 - s_chroma / 100.0
+        return 0.0
 
-        sigma = 15.0
-        score = np.exp(-(hue_diff_deg ** 2) / (2 * sigma ** 2))
+    # Chromatic: Lab Euclidean distance
+    dist = np.linalg.norm(s_lab - e_lab)
+    sigma = 25.0
+    score = np.exp(-(dist**2) / (2 * sigma**2))
 
-        # Penalize low saturation samples (gray/white shouldn't match chromatic)
-        if s_s < 40:
-            score *= 0.2
+    # Penalize low-chroma samples (gray/white shouldn't match chromatic)
+    chroma = np.sqrt((s_lab[1] - 128)**2 + (s_lab[2] - 128)**2)
+    if chroma < 15:
+        score *= 0.2
 
-        return score
+    return score
 
 
 class CubeColorCorrector:
@@ -133,15 +135,15 @@ class CubeColorCorrector:
         debug: 是否打印调试信息
     """
 
-    # 面颜色定义: (法线方向, 期望 RGB 颜色)
+    # 面颜色定义: (法线方向, 期望 RGB 颜色, 名称)
     # 与 mesh 贴图一致: Red=+X, Blue=+Y, White=+Z
     FACE_COLORS = [
-        (np.array([1, 0, 0], dtype=np.float64),  np.array([255, 0, 0])),      # +X = Red
-        (np.array([-1, 0, 0], dtype=np.float64), np.array([255, 140, 0])),     # -X = Orange
-        (np.array([0, 1, 0], dtype=np.float64),  np.array([0, 0, 255])),       # +Y = Blue
-        (np.array([0, -1, 0], dtype=np.float64), np.array([0, 255, 0])),       # -Y = Green
-        (np.array([0, 0, 1], dtype=np.float64),  np.array([255, 255, 255])),   # +Z = White
-        (np.array([0, 0, -1], dtype=np.float64), np.array([255, 255, 0])),     # -Z = Yellow
+        (np.array([1, 0, 0], dtype=np.float64),  np.array([255, 0, 0]),       "+X Red"),
+        (np.array([-1, 0, 0], dtype=np.float64), np.array([230, 90, 0]),      "-X Orange"),
+        (np.array([0, 1, 0], dtype=np.float64),  np.array([0, 0, 255]),       "+Y Blue"),
+        (np.array([0, -1, 0], dtype=np.float64), np.array([0, 255, 0]),       "-Y Green"),
+        (np.array([0, 0, 1], dtype=np.float64),  np.array([255, 255, 255]),   "+Z White"),
+        (np.array([0, 0, -1], dtype=np.float64), np.array([255, 255, 0]),     "-Z Yellow"),
     ]
 
     def __init__(self, half_size=0.0275, patch_radius=3, debug=False):
@@ -158,17 +160,28 @@ class CubeColorCorrector:
             M[:3, :3] = R
             self.rotations_4x4.append(M)
 
-        # 预计算面信息: (法线, 面中心, 期望RGB)
+        # 预计算面信息: (法线, 采样点列表, 期望RGB, 名称)
+        # 每个面在面上取 3x3 = 9 个采样点, 避免单点采到边缘或反光
         self.faces = []
-        for normal, color in self.FACE_COLORS:
-            center = self.half_size * normal
-            self.faces.append((normal, center, color))
+        sample_offsets = [-0.5, 0.0, 0.5]  # 相对 half_size 的偏移比例
+        for normal, color, name in self.FACE_COLORS:
+            # 找到面的两个切线方向
+            axis = np.argmax(np.abs(normal))
+            tangent_axes = [i for i in range(3) if i != axis]
+            sample_points = []
+            for s in sample_offsets:
+                for t in sample_offsets:
+                    pt = self.half_size * normal.copy()
+                    pt[tangent_axes[0]] = s * self.half_size
+                    pt[tangent_axes[1]] = t * self.half_size
+                    sample_points.append(pt)
+            self.faces.append((normal, sample_points, color, name))
 
         if self.debug:
             print(f"[CubeColorCorrector] half_size={half_size}m, patch_radius={patch_radius}px, "
-                  f"24 rotations, 6 faces")
+                  f"24 rotations, 6 faces, 9 samples/face")
 
-    def correct(self, pose, image_rgb, K, tf_to_centered_mesh):
+    def correct(self, pose, image_rgb, K, tf_to_centered_mesh, mask=None):
         """校正 register 后的 pose, 选出颜色匹配最佳的对称旋转.
 
         Args:
@@ -176,6 +189,7 @@ class CubeColorCorrector:
             image_rgb: HxWx3 RGB uint8 图像
             K: 3x3 相机内参矩阵
             tf_to_centered_mesh: 4x4 numpy, est.get_tf_to_centered_mesh() 结果
+            mask: HxW bool numpy, register 时使用的 mask 区域 (None=不约束)
 
         Returns:
             corrected_pose: 4x4 numpy, 校正后的 original-mesh pose
@@ -195,48 +209,64 @@ class CubeColorCorrector:
 
         scores_debug = []
 
+        # 存储每个候选的逐面详情 (用于 debug)
+        face_details_per_candidate = []
+
         for idx, R_sym in enumerate(self.rotations_3x3):
             score = 0.0
             total_weight = 0.0
+            face_details = []
 
-            for face_normal, face_center, expected_rgb in self.faces:
-                # Transform face normal and center to camera frame
+            for face_normal, sample_points, expected_rgb, face_name in self.faces:
+                # Transform face normal to camera frame (用第一个采样点算可见性)
                 rotated_normal = R_sym @ face_normal
-                rotated_center = R_sym @ face_center
 
                 n_cam = R_cam @ rotated_normal
-                c_cam = R_cam @ rotated_center + t_cam
 
                 # Visibility: face must point toward camera (z < -0.1)
                 if n_cam[2] >= -0.1:
+                    face_details.append((face_name, 'hidden', None, expected_rgb, 0, 0))
                     continue
 
-                # Must be in front of camera
-                if c_cam[2] <= 0.01:
+                # 对面上 9 个采样点投影并采样颜色
+                valid_samples = []
+                for sp in sample_points:
+                    rotated_sp = R_sym @ sp
+                    sp_cam = R_cam @ rotated_sp + t_cam
+
+                    if sp_cam[2] <= 0.01:
+                        continue
+
+                    proj = K @ sp_cam
+                    u = proj[0] / proj[2]
+                    v = proj[1] / proj[2]
+
+                    if u < 0 or u >= W or v < 0 or v >= H:
+                        continue
+
+                    c = sample_face_color(image_rgb, u, v, self.patch_radius)
+                    valid_samples.append(c)
+
+                if len(valid_samples) == 0:
+                    face_details.append((face_name, 'OOB', None, expected_rgb, 0, 0))
                     continue
 
-                # Project face center to image
-                proj = K @ c_cam
-                u = proj[0] / proj[2]
-                v = proj[1] / proj[2]
-
-                # Bounds check
-                if u < 0 or u >= W or v < 0 or v >= H:
-                    continue
-
-                # Sample color
-                sampled_rgb = sample_face_color(image_rgb, u, v, self.patch_radius)
+                # 取所有有效采样点的中位数颜色
+                sampled_rgb = np.median(np.array(valid_samples), axis=0)
 
                 # Score
                 s = color_match_score(sampled_rgb, expected_rgb)
                 weight = -n_cam[2]  # more facing camera = higher weight
                 score += s * weight
                 total_weight += weight
+                face_details.append((face_name, 'visible', sampled_rgb, expected_rgb, s, weight,
+                                     len(valid_samples)))
 
             if total_weight > 0:
                 score /= total_weight
 
             scores_debug.append(score)
+            face_details_per_candidate.append(face_details)
 
             if score > best_score:
                 best_score = score
@@ -258,5 +288,47 @@ class CubeColorCorrector:
                   f"#{sorted_scores[2][0]}={sorted_scores[2][1]:.3f}")
             is_identity = np.allclose(self.rotations_3x3[best_idx], np.eye(3))
             print(f"  Identity rotation: {is_identity}")
+
+            # 打印 best 候选的逐面详情
+            best_details = face_details_per_candidate[best_idx]
+            print(f"  --- Best candidate #{best_idx} per-face details ---")
+            for detail in best_details:
+                face_name, status = detail[0], detail[1]
+                if status != 'visible':
+                    print(f"    {face_name:12s}: [{status}]")
+                else:
+                    sampled, expected, s, w = detail[2], detail[3], detail[4], detail[5]
+                    n_samples = detail[6] if len(detail) > 6 else 1
+                    # 计算 Lab 距离
+                    s_bgr = np.uint8([[np.clip(sampled[::-1], 0, 255)]])
+                    e_bgr = np.uint8([[np.clip(expected[::-1], 0, 255)]])
+                    s_lab = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
+                    e_lab = cv2.cvtColor(e_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
+                    lab_dist = np.linalg.norm(s_lab - e_lab)
+                    print(f"    {face_name:12s}: sampled=({sampled[0]:.0f},{sampled[1]:.0f},{sampled[2]:.0f}) "
+                          f"expected=({expected[0]},{expected[1]},{expected[2]}) "
+                          f"Lab_dist={lab_dist:.1f} score={s:.3f} weight={w:.2f} pts={n_samples}")
+
+            # 如果 top-2 分数很接近, 也打印第 2 名的详情
+            if len(sorted_scores) >= 2:
+                second_idx = sorted_scores[1][0]
+                score_gap = sorted_scores[0][1] - sorted_scores[1][1]
+                if score_gap < 0.15:
+                    print(f"  --- Runner-up #{second_idx} (gap={score_gap:.3f}) per-face details ---")
+                    for detail in face_details_per_candidate[second_idx]:
+                        face_name, status = detail[0], detail[1]
+                        if status != 'visible':
+                            print(f"    {face_name:12s}: [{status}]")
+                        else:
+                            sampled, expected, s, w = detail[2], detail[3], detail[4], detail[5]
+                            n_samples = detail[6] if len(detail) > 6 else 1
+                            s_bgr = np.uint8([[np.clip(sampled[::-1], 0, 255)]])
+                            e_bgr = np.uint8([[np.clip(expected[::-1], 0, 255)]])
+                            s_lab = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
+                            e_lab = cv2.cvtColor(e_bgr, cv2.COLOR_BGR2Lab)[0, 0].astype(float)
+                            lab_dist = np.linalg.norm(s_lab - e_lab)
+                            print(f"    {face_name:12s}: sampled=({sampled[0]:.0f},{sampled[1]:.0f},{sampled[2]:.0f}) "
+                                  f"expected=({expected[0]},{expected[1]},{expected[2]}) "
+                                  f"Lab_dist={lab_dist:.1f} score={s:.3f} weight={w:.2f} pts={n_samples}")
 
         return corrected_pose, corrected_centered

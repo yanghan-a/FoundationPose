@@ -143,10 +143,18 @@ class TripletH5Dataset(PairH5Dataset):
     batch.poseA = batch.poseA.cuda()
     batch.Ks = batch.Ks.cuda()
 
+    # Process in chunks to avoid CUDA OOM on low-VRAM GPUs
+    chunk_size = 64
+
     if batch.xyz_mapAs is None:
-      depthAs_ori = kornia.geometry.transform.warp_perspective(batch.depthAs.cuda().expand(bs,-1,-1,-1), crop_to_oris, dsize=(H_ori, W_ori), mode='nearest', align_corners=False)
-      batch.xyz_mapAs = depth2xyzmap_batch(depthAs_ori[:,0], batch.Ks, zfar=np.inf).permute(0,3,1,2)  #(B,3,H,W)
-      batch.xyz_mapAs = kornia.geometry.transform.warp_perspective(batch.xyz_mapAs, tf_to_crops, dsize=(H,W), mode='nearest', align_corners=False)
+      xyz_mapAs_chunks = []
+      for i in range(0, bs, chunk_size):
+        j = min(i + chunk_size, bs)
+        depthAs_chunk = kornia.geometry.transform.warp_perspective(batch.depthAs[i:j].cuda(), crop_to_oris[i:j], dsize=(H_ori, W_ori), mode='nearest', align_corners=False)
+        xyz_chunk = depth2xyzmap_batch(depthAs_chunk[:,0], batch.Ks[i:j], zfar=np.inf).permute(0,3,1,2)
+        xyz_chunk = kornia.geometry.transform.warp_perspective(xyz_chunk, tf_to_crops[i:j], dsize=(H,W), mode='nearest', align_corners=False)
+        xyz_mapAs_chunks.append(xyz_chunk)
+      batch.xyz_mapAs = torch.cat(xyz_mapAs_chunks, dim=0)
     batch.xyz_mapAs = batch.xyz_mapAs.cuda()
     invalid = batch.xyz_mapAs[:,2:3]<0.1
     batch.xyz_mapAs = (batch.xyz_mapAs-batch.poseA[:,:3,3].reshape(bs,3,1,1))
@@ -156,9 +164,14 @@ class TripletH5Dataset(PairH5Dataset):
       batch.xyz_mapAs[invalid.expand(bs,3,-1,-1)] = 0
 
     if batch.xyz_mapBs is None:
-      depthBs_ori = kornia.geometry.transform.warp_perspective(batch.depthBs.cuda().expand(bs,-1,-1,-1), crop_to_oris, dsize=(H_ori, W_ori), mode='nearest', align_corners=False)
-      batch.xyz_mapBs = depth2xyzmap_batch(depthBs_ori[:,0], batch.Ks, zfar=np.inf).permute(0,3,1,2)  #(B,3,H,W)
-      batch.xyz_mapBs = kornia.geometry.transform.warp_perspective(batch.xyz_mapBs, tf_to_crops, dsize=(H,W), mode='nearest', align_corners=False)
+      xyz_mapBs_chunks = []
+      for i in range(0, bs, chunk_size):
+        j = min(i + chunk_size, bs)
+        depthBs_chunk = kornia.geometry.transform.warp_perspective(batch.depthBs[i:j].cuda(), crop_to_oris[i:j], dsize=(H_ori, W_ori), mode='nearest', align_corners=False)
+        xyz_chunk = depth2xyzmap_batch(depthBs_chunk[:,0], batch.Ks[i:j], zfar=np.inf).permute(0,3,1,2)
+        xyz_chunk = kornia.geometry.transform.warp_perspective(xyz_chunk, tf_to_crops[i:j], dsize=(H,W), mode='nearest', align_corners=False)
+        xyz_mapBs_chunks.append(xyz_chunk)
+      batch.xyz_mapBs = torch.cat(xyz_mapBs_chunks, dim=0)
     batch.xyz_mapBs = batch.xyz_mapBs.cuda()
     invalid = batch.xyz_mapBs[:,2:3]<0.1
     batch.xyz_mapBs = (batch.xyz_mapBs-batch.poseA[:,:3,3].reshape(bs,3,1,1))
