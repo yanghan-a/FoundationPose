@@ -181,7 +181,8 @@ class RealSenseRGBD:
           f"depth_scale={self.depth_scale} depth_max={self.depth_max}m")
     print(f"[RealSense] K=\n{self.K}")
 
-    for _ in range(30):
+    # 预热 N 帧让自动曝光稳定. 30 帧偏多, 10 帧实测够用; 手动曝光时可以更少.
+    for _ in range(10):
       self.pipeline.wait_for_frames()
 
     self._latest_color = None
@@ -310,6 +311,46 @@ def keep_only_score_vis(debug_dir, register_count):
         pass
 
 
+def make_center_bbox_mask(H, W, h_frac=0.5, w_frac=0.5):
+  """画面中央占长宽各 frac 的矩形 mask. 用于 --auto_bbox 模式跳过手动框选.
+  默认 0.5 表示 mask 占整图正中 H/2 x W/2 区域.
+  """
+  mask = np.zeros((H, W), dtype=bool)
+  cy, cx = H // 2, W // 2
+  hh = int(H * h_frac / 2)
+  hw = int(W * w_frac / 2)
+  mask[cy - hh:cy + hh, cx - hw:cx + hw] = True
+  return mask
+
+
+def warmup_estimator(est, K, H, W):
+  """用 dummy 数据跑一次 1-iteration 的 register, 把 nvdiffrast / refiner / scorer 的
+  CUDA kernel JIT 编译和 cudnn benchmark 一次性付清. 这样真正用户框选后的第一次
+  register 就能直接进入稳态 (~0.5s), 不再被首次编译开销拖累 1-3 秒.
+
+  注意: register 内部会改 est.pose_last / poses / scores / ob_mask / K / H / W,
+  跑完后 reset est.pose_last = None, 真正的用户 register 会重新走完整流程覆盖所有状态.
+  """
+  rgb_dummy = np.zeros((H, W, 3), dtype=np.uint8)
+  depth_dummy = np.full((H, W), 0.5, dtype=np.float32)   # 0.5m 平面深度, 保证有效
+  mask_dummy = np.zeros((H, W), dtype=bool)
+  mask_dummy[H // 4:3 * H // 4, W // 4:3 * W // 4] = True
+
+  print('[warmup] dummy register to JIT-compile CUDA kernels...')
+  prev_debug = est.debug
+  est.debug = 0   # 不写任何中间产物
+  t0 = time.time()
+  try:
+    est.register(K=K, rgb=rgb_dummy, depth=depth_dummy,
+                 ob_mask=mask_dummy, iteration=1)
+  except Exception as e:
+    print(f'[warmup] register failed (ignored): {e}')
+  finally:
+    est.debug = prev_debug
+  est.pose_last = None    # 防止污染真正 tracking 起点
+  print(f'[warmup] done in {time.time() - t0:.2f}s')
+
+
 def main():
   code_dir = os.path.dirname(os.path.realpath(__file__))
   parser = argparse.ArgumentParser()
@@ -338,6 +379,9 @@ def main():
                       help='每 N 帧 imshow 一次 (1=每帧都显示), 仅 --debug 1 时生效')
   parser.add_argument('--score_vis_topk', type=int, default=10,
                       help='vis_score.png 里画 top-N 得分的 pose. 0 或负值表示画全部 252 个.')
+  parser.add_argument('--auto_bbox', action='store_true',
+                      help='跳过手动框选, 用画面中央 H/2 x W/2 的矩形作为初始 mask. '
+                           '使用前把目标物体放在画面中央并距离相机适中.')
   args = parser.parse_args()
 
   set_logging_format()
@@ -375,12 +419,17 @@ def main():
                       color_gain=args.color_gain,
                       white_balance=args.white_balance)
   K = cam.K
+
+  # 把首次 GPU JIT 编译开销 (~1-3s) 在用户框选前一次性付清, 真正第一次 register 才能快
+  warmup_estimator(est, K, cam.H, cam.W)
+
   selector = BBoxSelector()
 
   pose = None
   frame_id = 0
   need_register = True
   last_cam_id = -1
+  register_bbox_2d = None    # (x1,y1,x2,y2) register 时 mask 的外接矩形, 用于可视化检查
 
   fps_window = []
   fps_window_size = 30
@@ -409,14 +458,25 @@ def main():
 
       if need_register:
         profiler.tock()
-        print("[register] Please draw a 2D bbox to initialize tracking")
-        mask = selector.select(color)
-        if mask is None:
-          print("[register] cancelled")
-          break
+        if args.auto_bbox:
+          H_img, W_img = color.shape[:2]
+          mask = make_center_bbox_mask(H_img, W_img)
+          print(f"[register] auto bbox: center {W_img//2} x {H_img//2} rectangle")
+        else:
+          print("[register] Please draw a 2D bbox to initialize tracking")
+          mask = selector.select(color)
+          if mask is None:
+            print("[register] cancelled")
+            break
         if mask.sum() < 50:
           print("[register] mask too small, please re-select")
           continue
+
+        # 记下 mask 的外接矩形, tracking 阶段会叠在画面上方便检查框选区域是否套住物体
+        ys, xs = np.where(mask)
+        register_bbox_2d = (int(xs.min()), int(ys.min()),
+                            int(xs.max()), int(ys.max()))
+
         # register 阶段临时打开 estimater 内部 debug, 让它生成 vis_score.png
         est.debug = 2
         try:
@@ -460,6 +520,12 @@ def main():
       if debug >= 1 and vis is not None and frame_id % args.show_every == 0:
         profiler.tick('imshow_waitkey')
         vis_bgr = vis[..., ::-1].copy()
+        # 把 register 时的 bbox 用黄色细线画出来, 方便目视确认初始 mask 框是否覆盖物体
+        if register_bbox_2d is not None:
+          x1, y1, x2, y2 = register_bbox_2d
+          cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 255, 255), 1)
+          cv2.putText(vis_bgr, 'register bbox', (x1, max(y1 - 5, 12)),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(vis_bgr, f"FPS: {fps_smoothed:5.1f}  ({frame_ms:5.1f} ms)",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow('track_single (q=quit, r=re-register)', vis_bgr)

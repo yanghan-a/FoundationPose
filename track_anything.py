@@ -189,7 +189,8 @@ class RealSenseRGBD:
           f"depth_scale={self.depth_scale} depth_max={self.depth_max}m")
     print(f"[RealSense] K=\n{self.K}")
 
-    for _ in range(30):
+    # 预热 N 帧让自动曝光稳定. 30 帧偏多, 10 帧实测够用.
+    for _ in range(10):
       self.pipeline.wait_for_frames()
 
     self._latest_color = None
@@ -337,6 +338,7 @@ class TrackedObject:
     self.pose = None              # (4,4) np array, 未 register 时为 None
     self.registered = False
     self.register_count = 0       # 累计 register 次数, 用于 vis_score 命名
+    self.register_bbox_2d = None  # (x1,y1,x2,y2) register 时 mask 外接矩形, 可视化用
 
   def _keep_only_score_vis(self):
     """register 完成后只保留 vis_score.png, 重命名累计存; 删掉其他中间产物."""
@@ -356,6 +358,11 @@ class TrackedObject:
           pass
 
   def register(self, K, rgb, depth, mask, iteration):
+    # 记下 mask 外接矩形, tracking 阶段叠在画面上方便目视检查
+    ys, xs = np.where(mask)
+    if len(xs) > 0:
+      self.register_bbox_2d = (int(xs.min()), int(ys.min()),
+                               int(xs.max()), int(ys.max()))
     # 临时打开 estimater 内部 debug 让它生成 vis_score.png 等
     self.est.debug = 2
     try:
@@ -373,6 +380,42 @@ class TrackedObject:
       return
     self.pose = self.est.track_one(rgb=rgb, depth=depth, K=K,
                                    iteration=iteration, profiler=profiler)
+
+
+def make_center_bbox_mask(H, W, h_frac=0.5, w_frac=0.5):
+  """画面中央占长宽各 frac 的矩形 mask. 用于 --auto_bbox 模式跳过手动框选."""
+  mask = np.zeros((H, W), dtype=bool)
+  cy, cx = H // 2, W // 2
+  hh = int(H * h_frac / 2)
+  hw = int(W * w_frac / 2)
+  mask[cy - hh:cy + hh, cx - hw:cx + hw] = True
+  return mask
+
+
+def warmup_estimator(est, K, H, W):
+  """用 dummy 数据跑一次 1-iteration 的 register, 把 nvdiffrast / refiner / scorer 的
+  CUDA kernel JIT 编译和 cudnn benchmark 一次性付清. 真正用户框选后的第一次 register
+  就能直接进稳态 (~0.5s), 不再被首次编译开销拖累 1-3 秒.
+
+  完成后 reset est.pose_last = None, 避免污染真正 tracking 起点.
+  """
+  rgb_dummy = np.zeros((H, W, 3), dtype=np.uint8)
+  depth_dummy = np.full((H, W), 0.5, dtype=np.float32)
+  mask_dummy = np.zeros((H, W), dtype=bool)
+  mask_dummy[H // 4:3 * H // 4, W // 4:3 * W // 4] = True
+
+  prev_debug = est.debug
+  est.debug = 0
+  t0 = time.time()
+  try:
+    est.register(K=K, rgb=rgb_dummy, depth=depth_dummy,
+                 ob_mask=mask_dummy, iteration=1)
+  except Exception as e:
+    print(f'[warmup] register failed (ignored): {e}')
+  finally:
+    est.debug = prev_debug
+  est.pose_last = None
+  return time.time() - t0
 
 
 def collect_mesh_files(args):
@@ -446,6 +489,9 @@ def main():
                       help='每 N 帧 imshow 一次 (1=每帧都显示), 仅 --debug 1 时生效')
   parser.add_argument('--score_vis_topk', type=int, default=10,
                       help='vis_score.png 里画 top-N 得分的 pose. 0 或负值表示画全部 252 个.')
+  parser.add_argument('--auto_bbox', action='store_true',
+                      help='跳过手动框选, 给每个物体都用画面中央 H/2 x W/2 的矩形作为初始 mask. '
+                           '多物体场景下假设物体都在画面中央, 不合适的话仍建议手动框选.')
   args = parser.parse_args()
 
   set_logging_format()
@@ -485,6 +531,18 @@ def main():
                       color_gain=args.color_gain,
                       white_balance=args.white_balance)
   K = cam.K
+
+  # 把首次 GPU JIT 编译开销 (~1-3s/物体) 在用户框选前一次性付清.
+  # 多物体: 每个物体的 mesh_tensors 不同, 第一次 nvdiffrast 用某个 mesh 编译的 kernel
+  # 可以在其他 mesh 上复用, 但 mesh_tensors 上传 GPU 是 per-object 的, 所以每个都跑一次.
+  print(f'[warmup] running dummy register for {len(objects)} object(s)...')
+  t_warm_total = 0.0
+  for obj in objects:
+    dt = warmup_estimator(obj.est, K, cam.H, cam.W)
+    t_warm_total += dt
+    print(f'[warmup]   {obj.name}: {dt:.2f}s')
+  print(f'[warmup] total {t_warm_total:.2f}s')
+
   selector = BBoxSelector()
 
   need_register_all = True
@@ -528,8 +586,14 @@ def main():
           # 每个物体框选前重新抓一帧, 避免用户思考期间画面陈旧
           color, depth, cam_id = cam.get_blocking()
           last_cam_id = cam_id
-          prompt = f"[{idx+1}/{len(objects)}] draw bbox for: {obj.name}"
-          mask, action = selector.select(color, prompt)
+          if args.auto_bbox:
+            H_img, W_img = color.shape[:2]
+            mask = make_center_bbox_mask(H_img, W_img)
+            action = 'ok'
+            print(f"[register] auto bbox for {obj.name}: center {W_img//2} x {H_img//2}")
+          else:
+            prompt = f"[{idx+1}/{len(objects)}] draw bbox for: {obj.name}"
+            mask, action = selector.select(color, prompt)
           if action == 'quit':
             do_quit = True
             break
@@ -588,6 +652,13 @@ def main():
       if debug >= 1 and vis is not None and frame_id % args.show_every == 0:
         profiler.tick('imshow_waitkey')
         vis_bgr = vis[..., ::-1].copy()
+        # 把每个已 register 物体的 mask 外接矩形用黄色细线画出来, 方便目视检查
+        for obj in objects:
+          if obj.registered and obj.register_bbox_2d is not None:
+            x1, y1, x2, y2 = obj.register_bbox_2d
+            cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 255, 255), 1)
+            cv2.putText(vis_bgr, f'register: {obj.name}', (x1, max(y1 - 5, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(vis_bgr, f"FPS: {fps_smoothed:5.1f}  ({frame_ms:5.1f} ms)",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow('Track Anything (q=quit, r=re-register all)', vis_bgr)
