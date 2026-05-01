@@ -25,7 +25,8 @@ from datareader import *
 
 
 def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
-  assert len(scores)==len(ids)
+  # 函数体内只通过 scores[id] 索引, ids 可以是 scores 的子集 (例如 top-k).
+  assert len(ids) <= len(scores), f"len(ids)={len(ids)} > len(scores)={len(scores)}"
   canvas = []
   for id in ids:
     rgbA_vis = (pose_data.rgbAs[id]*255).permute(1,2,0).data.cpu().numpy()
@@ -128,6 +129,9 @@ class ScorePredictor:
   def __init__(self, amp=True):
     self.amp = amp
     self.run_name = "2024-01-11-20-02-45"
+    # 生成 vis_score.png 时只画前 N 个得分最高的 pose. 调用方可在初始化后改写,
+    # 例如 scorer.vis_topk = 20. 设为 None 表示画全部 252 个 (老行为).
+    self.vis_topk = 10
 
     model_name = 'model_best.pth'
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -229,7 +233,11 @@ class ScorePredictor:
     if get_vis:
       logging.info("get_vis...")
       canvas = []
+      # 默认只画 top-N 得分的 pose (N = self.vis_topk, 默认 10), 调用方可改属性自定义.
+      # scores 本身仍然返回全量, 不影响 estimater 内部的 argsort/择优逻辑.
       ids = scores.argsort(descending=True)
+      if self.vis_topk is not None:
+        ids = ids[:self.vis_topk]
       canvas = vis_batch_data_scores(pose_data, ids=ids, scores=scores)
       return scores, canvas
 

@@ -1,31 +1,27 @@
 """
-FoundationPose tracking on cube54 with Intel RealSense.
+FoundationPose 单物体追踪 on Intel RealSense.
 
-基于 run_demo.py 的结构改造:
-  - 输入源换成 RealSense (RGB + 对齐 depth + 自动读取内参 K)
+通用单物体版本 (与 run_track_cube54.py 同结构, 但 mesh 必填, 不预设 cube54).
+
+  - 通过 --mesh_file 加载 1 个 mesh
   - 首帧鼠标框选 2D bbox 作为初始 mask -> est.register(...)
   - 后续帧 est.track_one(...)
-  - 默认 debug=3, 方便查看 register 阶段错误匹配的中间渲染、打分以及每帧追踪结果
 
 用法:
-  python run_track_cube54.py
-  python run_track_cube54.py --debug 3 --cam_width 640 --cam_height 480 --cam_fps 60
 
-  python run_track_cube54.py --debug 1 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 8000 --depth_exposure 8000
 
-  python run_track_cube54.py --debug 0 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 40 --depth_max 0.6
+  python track_single.py --mesh_file demo_data/cube54/mesh/textured_cube54.obj --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6 --cam_width 640 --cam_height 480 --cam_fps 90 --score_vis_topk 5 --debug 1
 
-  python run_track_cube54.py --debug 0 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6
 
 按键:
   q  退出
   r  重新框选 (触发 re-register)
 
-debug 等级 (沿用 run_demo.py / estimater.py 内的语义):
-  0  仅终端输出
-  1  实时显示 bbox+xyz 轴
-  2  额外保存 track_vis/{i}.png 以及 register 阶段的 ob_mask.png/color.png/depth.png/scene_*.ply/init_center.ply/vis_refiner.png/vis_score.png
-  3  额外保存 model_tf.obj 等
+debug 等级:
+  0  tracking 阶段静默 (无窗口, Ctrl+C 退出)
+  1  tracking 阶段显示窗口 (q 退出 / r 重新框选)
+两档下 register 阶段都会在 debug_dir 下保存 vis_score_NNN.png 用于检查最高分匹配.
+tracking 阶段始终不写文件、不影响帧率.
 """
 
 from estimater import *
@@ -38,26 +34,15 @@ import pyrealsense2 as rs
 
 
 class FrameProfiler:
-  """每阶段耗时统计 (CUDA sync 后取真实 GPU 耗时), **按帧聚合**。
-
-  关键: 一帧内多次 tick(同一 name) 会累加, 跨帧通过 frame_mark() 提交。
-  所以 summary 中每个阶段是 "本帧总耗时" 的窗口平均, TOTAL = 实际平均帧耗时,
-  不会再因为 refiner 单帧迭代多次或 imshow 跨帧执行而失真。
-
-  用法:
-    p = FrameProfiler()
-    while ...:
-      p.tick('a'); ...; p.tick('b'); ...; p.frame_mark()
-    print(p.summary_str())
-  """
+  """每阶段耗时统计 (CUDA sync 后取真实 GPU 耗时), 按帧聚合."""
 
   def __init__(self, window=60, use_cuda_sync=True):
     self.window = window
     self.use_cuda_sync = use_cuda_sync
-    self.history = defaultdict(list)        # stage -> list of per-frame total durations
+    self.history = defaultdict(list)
     self._pending_name = None
     self._pending_t0 = None
-    self._cur_frame = defaultdict(float)    # 本帧内每个 stage 累计耗时
+    self._cur_frame = defaultdict(float)
 
   def tick(self, name):
     now = self._sync_time()
@@ -74,7 +59,6 @@ class FrameProfiler:
     self._pending_name = None
 
   def frame_mark(self):
-    """提交本帧统计。stage 只在某些帧触发的, 缺席帧用 0 补齐, 这样平均才对。"""
     self.tock()
     all_stages = set(self.history.keys()) | set(self._cur_frame.keys())
     for s in all_stages:
@@ -109,39 +93,19 @@ class FrameProfiler:
 
 
 class RealSenseRGBD:
-  """RealSense 异步抓帧, depth 对齐到 color, 单位米。
-
-  后台 daemon 线程持续 wait_for_frames + align, 主线程通过 get() 拿最新一帧。
-  这样主循环不会被相机硬件帧率阻塞。
-
-  设备无关: D435i / D405 / D455 均可。depth_max 默认按 D435i 的 3m 设置,
-  使用 D405 这种短距相机时建议传 depth_max=0.6 以滤掉超量程的噪声深度。
-  """
+  """RealSense 异步抓帧, depth 对齐到 color, 单位米."""
 
   def __init__(self, width=640, height=480, fps=30, depth_max=3.0,
                color_exposure=None, depth_exposure=None,
                color_gain=None, white_balance=None):
-    """
-    Args:
-      color_exposure: None=自动曝光开; int=手动曝光值(微秒, 例如 100/200/500/1000)
-      depth_exposure: None=自动; int=手动 (D405 这种全局快门相机, 手动曝光对快速运动有意义)
-      color_gain:     None=自动; int=手动增益 (一般配合手动曝光使用, 0~128 量级)
-      white_balance:  None=自动; int=手动白平衡色温 (K, 例如 4000~6500)
-    """
     self.pipeline = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
     profile = self.pipeline.start(cfg)
     self.align = rs.align(rs.stream.color)
-
-    # 设备型号, 仅用于日志
     self.product_name = profile.get_device().get_info(rs.camera_info.name)
 
-    # ---- 反查 color / depth 各自所属的 sensor ----
-    # D435i: color 和 depth 是两个独立的物理传感器, query_sensors() 返回 2 个对象。
-    # D405:  双 RGB stereo, color 和 depth 是同一个物理传感器, query_sensors() 返回 1 个,
-    #        first_color_sensor() 会抛 "Could not find requested sensor type"。
     color_sensor = None
     depth_sensor = None
     for s in profile.get_device().query_sensors():
@@ -157,21 +121,18 @@ class RealSenseRGBD:
       raise RuntimeError("no depth sensor found on device")
     if color_sensor is None:
       raise RuntimeError("no color sensor found on device")
-    shared_sensor = (color_sensor is depth_sensor)
-    if shared_sensor:
-      print(f"[RealSense] color & depth share one sensor "
-            f"(D405-style); color/depth_exposure 会写到同一个 option")
+    if color_sensor is depth_sensor:
+      print(f"[RealSense] color & depth share one sensor (D405-style)")
 
-    # depth_scale: query_sensors() 返回的是基类 rs.sensor, 没有 get_depth_scale。
-    # 优先 cast 到 depth_sensor; 失败再退回到 rs.option.depth_units。
     try:
       self.depth_scale = depth_sensor.as_depth_sensor().get_depth_scale()
     except Exception:
       try:
         self.depth_scale = depth_sensor.get_option(rs.option.depth_units)
       except Exception:
-        self.depth_scale = 0.001  # 兜底, 大多数 RealSense 是 1mm
+        self.depth_scale = 0.001
     self.depth_max = float(depth_max)
+
     if color_exposure is None:
       color_sensor.set_option(rs.option.enable_auto_exposure, 1)
       print(f"[RealSense] color: AE on")
@@ -225,7 +186,7 @@ class RealSenseRGBD:
 
     self._latest_color = None
     self._latest_depth = None
-    self._latest_id = 0          # 单调递增, 主线程可据此判断是否拿到了新帧
+    self._latest_id = 0
     self._lock = threading.Lock()
     self._running = True
     self._thread = threading.Thread(target=self._grab_loop, daemon=True)
@@ -251,14 +212,12 @@ class RealSenseRGBD:
         print(f"[RealSense] grab error: {e}")
 
   def get(self):
-    """返回 (rgb, depth, frame_id)。frame_id 单调递增, 同一帧多次调用 frame_id 不变。"""
     with self._lock:
       if self._latest_color is None:
         return None, None, 0
       return self._latest_color, self._latest_depth, self._latest_id
 
   def get_blocking(self):
-    """阻塞直到至少有一帧可用 (用于 register 前的首帧)。"""
     while True:
       c, d, fid = self.get()
       if c is not None:
@@ -295,7 +254,7 @@ class BBoxSelector:
     self.p0 = self.p1 = None
     self.dragging = False
     self.done = False
-    win = "Drag a box around the cube, then press ENTER (ESC to cancel)"
+    win = "Drag a box around the object, then press ENTER (ESC to cancel)"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(win, self._cb)
     bgr = rgb[..., ::-1].copy()
@@ -320,60 +279,93 @@ class BBoxSelector:
     return mask
 
 
+# register 完成后会在 debug_dir 留下这些中间产物, 我们只想留 vis_score.png,
+# 其余清理掉以保持目录干净.
+_REGISTER_INTERMEDIATE_FILES = [
+    'ob_mask.png', 'color.png', 'depth.png',
+    'scene_raw.ply', 'scene_complete.ply',
+    'init_center.ply', 'vis_refiner.png', 'model_tf.obj',
+]
+
+
+def keep_only_score_vis(debug_dir, register_count):
+  """register 后只保留 vis_score.png 并按次累计重命名为 vis_score_NNN.png.
+
+  estimater.debug=2 时会写一堆中间产物, 这里全部清理只留打分图.
+  按 register_count 累计命名, 这样多次按 r 重新框选都能各留一张, 不会互相覆盖.
+  """
+  src = os.path.join(debug_dir, 'vis_score.png')
+  if os.path.exists(src):
+    dst = os.path.join(debug_dir, f'vis_score_{register_count:03d}.png')
+    os.replace(src, dst)
+    print(f"[register] saved score visualization -> {dst}")
+  else:
+    print(f"[register] WARNING: vis_score.png not generated by estimater")
+  for fn in _REGISTER_INTERMEDIATE_FILES:
+    p = os.path.join(debug_dir, fn)
+    if os.path.exists(p):
+      try:
+        os.remove(p)
+      except OSError:
+        pass
+
+
 def main():
   code_dir = os.path.dirname(os.path.realpath(__file__))
   parser = argparse.ArgumentParser()
-  parser.add_argument('--mesh_file', type=str,
-                      default=f'{code_dir}/demo_data/cube54/mesh/textured_cube54.obj')
+  parser.add_argument('--mesh_file', type=str, required=True,
+                      help='待追踪物体的 mesh 文件 (.obj/.ply)')
   parser.add_argument('--est_refine_iter', type=int, default=5)
   parser.add_argument('--track_refine_iter', type=int, default=2)
-  parser.add_argument('--debug', type=int, default=3)
-  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_cube54')
+  parser.add_argument('--debug', type=int, default=1, choices=[0, 1],
+                      help='0=tracking 阶段静默(无窗口, Ctrl+C 退出); '
+                           '1=tracking 阶段显示窗口. 两档 register 都会保存 vis_score_NNN.png.')
+  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_single')
   parser.add_argument('--cam_width', type=int, default=640)
   parser.add_argument('--cam_height', type=int, default=480)
   parser.add_argument('--cam_fps', type=int, default=30)
   parser.add_argument('--depth_max', type=float, default=3.0,
-                      help='超过此距离(米)的深度被清零。D435i 用 3.0, D405 建议 0.6')
+                      help='超过此距离(米)的深度被清零. D435i 用 3.0, D405 建议 0.6')
   parser.add_argument('--color_exposure', type=int, default=None,
-                      help='color 手动曝光(us), 不传 = 自动曝光。快速运动建议 100~300')
+                      help='color 手动曝光(us), 不传 = 自动曝光')
   parser.add_argument('--depth_exposure', type=int, default=None,
                       help='depth 手动曝光(us), 不传 = 自动')
   parser.add_argument('--color_gain', type=int, default=None,
                       help='color 手动增益, 配合短曝光使用以保持亮度')
   parser.add_argument('--white_balance', type=int, default=None,
                       help='color 手动白平衡(K), 例如 4000~6500, 不传 = 自动')
-  parser.add_argument('--show_every', type=int, default=2,
-                      help='每 N 帧 imshow 一次 (1=每帧都显示)')
+  parser.add_argument('--show_every', type=int, default=1,
+                      help='每 N 帧 imshow 一次 (1=每帧都显示), 仅 --debug 1 时生效')
+  parser.add_argument('--score_vis_topk', type=int, default=10,
+                      help='vis_score.png 里画 top-N 得分的 pose. 0 或负值表示画全部 252 个.')
   args = parser.parse_args()
 
   set_logging_format()
   set_seed(0)
-
-  # estimater / refiner / scorer 内部有大量 logging.info("Welcome"/"forward start"/...),
-  # 每帧每迭代都会打, 实测刷屏。这里把 root logger 降到 WARNING, 只保留我们自己的
-  # print() 输出 (FPS / profile / register 状态)。
   logging.getLogger().setLevel(logging.WARNING)
 
   debug = args.debug
   debug_dir = args.debug_dir
-  # debug<2 时不写任何文件; debug>=2 才清空并准备 track_vis / ob_in_cam 目录
-  if debug >= 2:
-    os.system(f'rm -rf {debug_dir}/* && mkdir -p {debug_dir}/track_vis {debug_dir}/ob_in_cam')
+  os.makedirs(debug_dir, exist_ok=True)
+  register_count = 0
 
   mesh = trimesh.load(args.mesh_file)
-  # 直接用 mesh.bounds 画 bbox, 不走 trimesh.bounds.oriented_bounds():
-  # 后者对完美对称的正方体会返回退化 OBB(实测 cube54 给 diag(-1,-1,1)),
-  # 导致后续 pose @ inv(to_origin) 把显示的 X/Y 轴在物体上转 180度.
-  # cube54 顶点已经在 ±0.027 居中且轴对齐, mesh 自带的 bounds 就是正确的物体 bbox.
+  # 用 mesh.bounds 画 AABB, 跳过 trimesh.bounds.oriented_bounds():
+  # 后者对完美对称的物体 (例如正方体) 会返回退化 OBB,
+  # 导致后续 pose @ inv(to_origin) 把显示的物体坐标系转到 OBB 系而非 obj 原生系.
   bbox = np.stack([mesh.bounds[0], mesh.bounds[1]], axis=0).reshape(2, 3)
   print(f"[init] loaded mesh: {args.mesh_file}, extents={mesh.extents}")
 
   scorer = ScorePredictor()
+  scorer.vis_topk = args.score_vis_topk if args.score_vis_topk > 0 else None
   refiner = PoseRefinePredictor()
   glctx = dr.RasterizeCudaContext()
+  # estimater 默认静默 (debug=0); register 时临时设为 2 让它生成 vis_score.png 等中间产物,
+  # 之后立刻切回 0, 这样 track_one 内部不会再渲染 vis (refiner.predict 的 get_vis=False),
+  # tracking 帧率不受 debug 拖累.
   est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals,
                        mesh=mesh, scorer=scorer, refiner=refiner,
-                       debug_dir=debug_dir, debug=debug, glctx=glctx)
+                       debug_dir=debug_dir, debug=0, glctx=glctx)
   print("[init] estimator ready")
 
   cam = RealSenseRGBD(width=args.cam_width, height=args.cam_height,
@@ -388,15 +380,15 @@ def main():
   pose = None
   frame_id = 0
   need_register = True
-  last_cam_id = -1       # 上一帧使用的相机帧 id, 用于跳过重复帧
+  last_cam_id = -1
 
-  fps_window = []        # 最近若干帧的时间戳, 用于估算 tracking FPS
+  fps_window = []
   fps_window_size = 30
   last_print_t = time.time()
   fps_smoothed = 0.0
 
   profiler = FrameProfiler(window=60, use_cuda_sync=True)
-  PROFILE_PRINT_INTERVAL = 2.0   # 秒, 每隔 N 秒打印一次阶段耗时
+  PROFILE_PRINT_INTERVAL = 2.0
   last_profile_print_t = time.time()
 
   try:
@@ -405,14 +397,11 @@ def main():
 
       profiler.tick('cam_get')
       if need_register:
-        # register 前必须有一帧
         color, depth, cam_id = cam.get_blocking()
       else:
         color, depth, cam_id = cam.get()
         if color is None or cam_id == last_cam_id:
-          # 没拿到新帧, 主循环空转避免重复处理同一帧
           profiler.tock()
-          # 这一轮没真正处理一帧, 不调 frame_mark, 避免污染统计
           profiler._cur_frame.clear()
           time.sleep(0.001)
           continue
@@ -428,46 +417,35 @@ def main():
         if mask.sum() < 50:
           print("[register] mask too small, please re-select")
           continue
-        pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask,
-                            iteration=args.est_refine_iter)
+        # register 阶段临时打开 estimater 内部 debug, 让它生成 vis_score.png
+        est.debug = 2
+        try:
+          pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask,
+                              iteration=args.est_refine_iter)
+        finally:
+          est.debug = 0
         print(f"[register] done, pose=\n{pose}")
-
-        if debug >= 3:
-          m = mesh.copy()
-          m.apply_transform(pose)
-          m.export(f'{debug_dir}/model_tf.obj')
-          xyz_map = depth2xyzmap(depth, K)
-          valid = depth >= 0.001
-          pcd = toOpen3dCloud(xyz_map[valid], color[valid])
-          o3d.io.write_point_cloud(f'{debug_dir}/scene_complete.ply', pcd)
+        keep_only_score_vis(debug_dir, register_count)
+        register_count += 1
 
         need_register = False
         frame_id = 0
-        # register 比较慢, 不计入稳态 profile, 直接清掉历史
         profiler.history.clear()
         last_profile_print_t = time.time()
         continue
       else:
-        # track_one 内部会 tick 'depth_to_gpu' / 'erode_depth' / 'bilateral_filter' /
-        # 'depth2xyzmap' / 'refiner_predict' / 'pose_to_cpu', refiner.predict 内部会
-        # 进一步 tick 'refiner_crop_render' / 'refiner_data_concat' / 'refiner_nn_forward' /
-        # 'refiner_pose_update'。这里只要把 profiler 传进去即可。
         pose = est.track_one(rgb=color, depth=depth, K=K,
                              iteration=args.track_refine_iter,
                              profiler=profiler)
 
-      if debug >= 2:
-        profiler.tick('save_pose')
-        np.savetxt(f'{debug_dir}/ob_in_cam/{frame_id:05d}.txt', pose.reshape(4, 4))
+      # 仅 debug>=1 才画轴和 bbox, 否则连这点开销都省 (debug=0 = 真静默最快)
+      vis = None
+      if debug >= 1:
+        profiler.tick('vis_render')
+        vis = draw_posed_3d_box(K, img=color, ob_in_cam=pose, bbox=bbox)
+        vis = draw_xyz_axis(vis, ob_in_cam=pose, scale=0.05, K=K,
+                            thickness=3, transparency=0, is_input_rgb=True)
 
-      profiler.tick('vis_render')
-      # 直接使用 pose (obj 原生坐标系 -> camera), 不再乘 inv(to_origin),
-      # 这样画出来的 XYZ 轴和 obj 文件里顶点定义的物体坐标系一致.
-      vis = draw_posed_3d_box(K, img=color, ob_in_cam=pose, bbox=bbox)
-      vis = draw_xyz_axis(vis, ob_in_cam=pose, scale=0.05, K=K,
-                          thickness=3, transparency=0, is_input_rgb=True)
-
-      # ---- FPS 统计 ----
       t_now = time.time()
       fps_window.append(t_now)
       if len(fps_window) > fps_window_size:
@@ -479,14 +457,12 @@ def main():
         print(f"[fps] FPS={fps_smoothed:5.1f}  frame={frame_ms:5.1f}ms  id={frame_id}")
         last_print_t = t_now
 
-      # ---- 显示 (每 SHOW_EVERY 帧一次, 节省 imshow+waitKey 开销) ----
-      vis_bgr = None
-      if frame_id % args.show_every == 0:
+      if debug >= 1 and vis is not None and frame_id % args.show_every == 0:
         profiler.tick('imshow_waitkey')
         vis_bgr = vis[..., ::-1].copy()
         cv2.putText(vis_bgr, f"FPS: {fps_smoothed:5.1f}  ({frame_ms:5.1f} ms)",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow('cube55 tracking (q=quit, r=re-register)', vis_bgr)
+        cv2.imshow('track_single (q=quit, r=re-register)', vis_bgr)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
           profiler.frame_mark()
@@ -496,17 +472,8 @@ def main():
           need_register = True
           continue
 
-      if debug >= 2:
-        profiler.tick('save_vis')
-        if vis_bgr is None:
-          vis_bgr = vis[..., ::-1].copy()
-          cv2.putText(vis_bgr, f"FPS: {fps_smoothed:5.1f}  ({frame_ms:5.1f} ms)",
-                      (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        imageio.imwrite(f'{debug_dir}/track_vis/{frame_id:05d}.png', vis_bgr[..., ::-1])
+      profiler.frame_mark()
 
-      profiler.frame_mark()  # 提交本帧所有阶段统计
-
-      # ---- 每隔 N 秒打印阶段耗时 ----
       if t_now - last_profile_print_t >= PROFILE_PRINT_INTERVAL:
         print(
             f"\n===== Stage profile (avg over last {profiler.window} frames) =====\n"
