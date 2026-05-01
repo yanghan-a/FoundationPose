@@ -1,5 +1,5 @@
 """
-FoundationPose tracking on cube55 with Intel RealSense.
+FoundationPose tracking on cube54 with Intel RealSense.
 
 基于 run_demo.py 的结构改造:
   - 输入源换成 RealSense (RGB + 对齐 depth + 自动读取内参 K)
@@ -8,10 +8,14 @@ FoundationPose tracking on cube55 with Intel RealSense.
   - 默认 debug=3, 方便查看 register 阶段错误匹配的中间渲染、打分以及每帧追踪结果
 
 用法:
-  python run_track_cube55.py
-  python run_track_cube55.py --debug 3 --cam_width 640 --cam_height 480 --cam_fps 60
+  python run_track_cube54.py
+  python run_track_cube54.py --debug 3 --cam_width 640 --cam_height 480 --cam_fps 60
 
-  python run_track_cube55.py --debug 1 --cam_width 640 --cam_height 480 --cam_fps 90 --color_exposure 8000 --depth_exposure 8000
+  python run_track_cube54.py --debug 1 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 8000 --depth_exposure 8000
+
+  python run_track_cube54.py --debug 0 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 40 --depth_max 0.6
+
+  python run_track_cube54.py --debug 0 --cam_width 640 --cam_height 480 --cam_fps 90 --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6
 
 按键:
   q  退出
@@ -320,11 +324,11 @@ def main():
   code_dir = os.path.dirname(os.path.realpath(__file__))
   parser = argparse.ArgumentParser()
   parser.add_argument('--mesh_file', type=str,
-                      default=f'{code_dir}/demo_data/cube55/mesh/textured_simple.obj')
+                      default=f'{code_dir}/demo_data/cube54/mesh/textured_cube54.obj')
   parser.add_argument('--est_refine_iter', type=int, default=5)
   parser.add_argument('--track_refine_iter', type=int, default=2)
   parser.add_argument('--debug', type=int, default=3)
-  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_cube55')
+  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_cube54')
   parser.add_argument('--cam_width', type=int, default=640)
   parser.add_argument('--cam_height', type=int, default=480)
   parser.add_argument('--cam_fps', type=int, default=30)
@@ -352,12 +356,17 @@ def main():
 
   debug = args.debug
   debug_dir = args.debug_dir
-  os.system(f'rm -rf {debug_dir}/* && mkdir -p {debug_dir}/track_vis {debug_dir}/ob_in_cam')
+  # debug<2 时不写任何文件; debug>=2 才清空并准备 track_vis / ob_in_cam 目录
+  if debug >= 2:
+    os.system(f'rm -rf {debug_dir}/* && mkdir -p {debug_dir}/track_vis {debug_dir}/ob_in_cam')
 
   mesh = trimesh.load(args.mesh_file)
-  to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-  bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
-  print(f"[init] loaded mesh: {args.mesh_file}, extents={extents}")
+  # 直接用 mesh.bounds 画 bbox, 不走 trimesh.bounds.oriented_bounds():
+  # 后者对完美对称的正方体会返回退化 OBB(实测 cube54 给 diag(-1,-1,1)),
+  # 导致后续 pose @ inv(to_origin) 把显示的 X/Y 轴在物体上转 180度.
+  # cube54 顶点已经在 ±0.027 居中且轴对齐, mesh 自带的 bounds 就是正确的物体 bbox.
+  bbox = np.stack([mesh.bounds[0], mesh.bounds[1]], axis=0).reshape(2, 3)
+  print(f"[init] loaded mesh: {args.mesh_file}, extents={mesh.extents}")
 
   scorer = ScorePredictor()
   refiner = PoseRefinePredictor()
@@ -447,13 +456,15 @@ def main():
                              iteration=args.track_refine_iter,
                              profiler=profiler)
 
-      profiler.tick('save_pose')
-      np.savetxt(f'{debug_dir}/ob_in_cam/{frame_id:05d}.txt', pose.reshape(4, 4))
+      if debug >= 2:
+        profiler.tick('save_pose')
+        np.savetxt(f'{debug_dir}/ob_in_cam/{frame_id:05d}.txt', pose.reshape(4, 4))
 
       profiler.tick('vis_render')
-      center_pose = pose @ np.linalg.inv(to_origin)
-      vis = draw_posed_3d_box(K, img=color, ob_in_cam=center_pose, bbox=bbox)
-      vis = draw_xyz_axis(vis, ob_in_cam=center_pose, scale=0.05, K=K,
+      # 直接使用 pose (obj 原生坐标系 -> camera), 不再乘 inv(to_origin),
+      # 这样画出来的 XYZ 轴和 obj 文件里顶点定义的物体坐标系一致.
+      vis = draw_posed_3d_box(K, img=color, ob_in_cam=pose, bbox=bbox)
+      vis = draw_xyz_axis(vis, ob_in_cam=pose, scale=0.05, K=K,
                           thickness=3, transparency=0, is_input_rgb=True)
 
       # ---- FPS 统计 ----
