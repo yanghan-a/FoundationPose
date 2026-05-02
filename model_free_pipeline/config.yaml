@@ -1,0 +1,25 @@
+# Model-free pipeline 默认配置. 命令行参数会覆盖这里的值.
+
+capture:
+  width: 640
+  height: 480
+  fps: 30
+  depth_max: 1.5
+  color_exposure: null      # null = AE 开
+  depth_exposure: null
+  color_gain: null
+  white_balance: null
+  n_frames: 80
+  min_save_interval_ms: 80
+
+mask:
+  # 只在用户没提供 masks/ 时生效. 球形包围: 半径 ob_radius (米);
+  # 想用 AABB 就把 ob_box 填成 [hx, hy, hz] 物体在 ob 系下的半边长 (米),
+  # 此时 ob_radius 被忽略. 选小了切到物体, 选大了多带点背景 — NOF 鲁棒.
+  ob_radius: 0.15
+  ob_box: null
+
+reconstruct:
+  cfg: bundlesdf/config_ycbv.yml   # 相对 FoundationPose 根目录, 也可绝对
+  n_step: 1000                     # 训练步数
+  mesh_resolution: 0.003           # 米, 越小越精细越慢

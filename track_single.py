@@ -10,7 +10,7 @@ FoundationPose 单物体追踪 on Intel RealSense.
 用法:
 
 
-  python track_single.py --mesh_file demo_data/cube54/mesh/textured_cube54.obj --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6 --cam_width 640 --cam_height 480 --cam_fps 90 --score_vis_topk 5 --debug 1
+  python track_single.py --mesh_file demo_data/cube54/mesh/textured_cube54.obj --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6 --cam_width 640 --cam_height 480 --cam_fps 90 --score_vis_topk 5 --auto_bbox --debug 1
 
 
 按键:

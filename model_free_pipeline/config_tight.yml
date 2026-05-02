@@ -1,0 +1,113 @@
+# 收紧版 NerfRunner 配置, 继承 bundlesdf/config_ycbv.yml 大部分默认.
+# 用法: python -m model_free_pipeline.pipeline reconstruct \
+#         --out real_data/cube54 \
+#         --recon_cfg model_free_pipeline/config_tight.yml
+#
+# 主要为小物体 (≤ 10cm) 调紧:
+#   - mesh_resolution 1mm 体素 -> 离散化误差从 ±1.5mm 降到 ±0.5mm
+#   - trunc 5mm -> SDF 截断带收一半, 表面更锐
+#   - n_step 2000 -> 让 SDF 在更紧的截断带里训到位
+# 代价: 训练时长 ~2-3x, mesh 顶点数 ~3-5x.
+
+notes: 'tight config for small object (<= 10cm)'
+n_step: 2000
+netdepth: 8
+netwidth: 256
+netdepth_fine: 8
+netwidth_fine: 256
+N_rand: 2048
+first_frame_ray_in_batch: 0
+lrate: 0.01
+lrate_pose: 0.01
+pose_optimize_start: 0
+decay_rate: 0.1
+chunk: 99999999999
+netchunk: 6553600
+no_batching: 0
+amp: true
+
+N_samples: 128
+N_samples_around_depth: 128
+N_importance: 0
+N_importance_iter: 1
+perturb: 1
+use_viewdirs: 1
+i_embed: 1
+i_embed_views: 2
+multires: 8
+multires_views: 3
+feature_grid_dim: 2
+raw_noise_std: 0
+white_bkgd: 0
+gradient_max_norm: 0.1
+gradient_pose_max_norm: 0.1
+
+i_print: 500
+i_img: 500
+i_weights: 500
+i_mesh: 500
+i_nerf_normals: 500
+i_save_ray: 500
+i_pose: 500
+save_octree_clouds: True
+
+finest_res: 512
+base_res: 32
+num_levels: 16
+log2_hashmap_size: 22
+datadir: ''
+n_train_image: 300
+use_octree: 1
+first_frame_weight: 1
+denoise_depth_use_octree_cloud: true
+octree_embed_base_voxel_size: 0.01    # 小物体改 1cm
+octree_smallest_voxel_size: 0.01
+octree_raytracing_voxel_size: 0.01
+octree_dilate_size: 0.01
+down_scale_ratio: 1
+bounding_box: [[-1,-1,-1], [1,1,1]]
+farthest_pose_sampling: 0
+use_mask: 1
+dilate_mask_size: 0
+rays_valid_depth_only: true
+near: 0.1
+far: 2
+rgb_weight: 100
+depth_weight: 0
+trunc: 0.005       # ← 5mm 截断带 (原 10mm)
+trunc_start: 0.005
+sdf_lambda: 5
+neg_trunc_ratio: 1
+trunc_decay_type: ''
+sdf_loss_type: l2
+fs_weight: 100
+empty_weight: 1
+fs_rgb_weight: 0
+trunc_weight: 6000
+sparse_loss_weight: 0
+tv_loss_weight: 0
+frame_features: 2
+optimize_poses: 1
+pose_reg_weight: 0
+point_cloud_loss_weight: 0
+point_cloud_loss_normal_weight: 0
+eikonal_weight: 0
+normal_loss_weight: 0
+feature_reg_weight: 0.1
+deformation_reg_weight: 0
+use_deformation_field: 0
+max_pix_shift: 0.02
+share_coarse_fine: 1
+mode: sdf
+fs_sdf: 1
+crop: 0
+mesh_resolution: 0.001    # ← 1mm 体素 (原 3mm)
+max_trans: 0.02
+max_rot: 10
+
+continual: True
+
+dbscan_eps: 0.005          # 小物体改紧
+dbscan_eps_min_samples: 1
+
+sync_max_delay: 0

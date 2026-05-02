@@ -1,0 +1,127 @@
+# cube54 (54mm 立方体) 经验回归后的稳定最佳配置. 用法:
+#   python -m model_free_pipeline.pipeline reconstruct \
+#       --out real_data/cube54 \
+#       --recon_cfg model_free_pipeline/config_best.yml \
+#       --tex_res 2048 --plot
+#
+# 与默认 config_ycbv.yml 相比的关键改动 (按效用排序):
+#   trunc              0.010 -> 0.005    SDF 截断带从 10mm 收到 5mm,  mesh 不胖
+#   mesh_resolution    0.003 -> 0.001    marching cubes 体素从 3mm 到 1mm
+#   octree*_size       0.020 -> 0.010    场景表征从 2cm 到 1cm
+#   dbscan_eps         0.010 -> 0.005    物体点云聚类适度收紧 (太严会切簇)
+#   rgb_weight         100   -> 150      贴图监督权重 ↑
+#   n_step             1000  -> 6000     上次 v2 在 3000 步时 sdf_loss 仍在掉, 翻倍
+#
+# 实验过但反而退步的改动 (留作教训):
+#   - dbscan_eps 0.003 (太严, 把物体点云切成多簇, 几何退步 +2.3mm)
+#   - first_frame_weight 5 (首帧 over-anchor, 把场景拉向首帧 pose 偏置)
+#   - trunc_weight 10000 (单独看应该好, 但和上面坏改动叠加产生不稳)
+#
+# 注: eikonal_weight 不能开. 上游 nerf_runner.train_loop() 里 self.render(...)
+# 硬编码 get_normals=False, 一开就 KeyError.
+#
+# 预期 cube54: mesh extents 进 [55, 57] mm, 贴图 2048 res 细节翻倍.
+# 训练时长: 4060 Ti 上 ~10-15 分钟.
+
+notes: 'stable best config (regressed from over-tuned v3); v2 baseline + n_step doubled'
+n_step: 6000
+netdepth: 8
+netwidth: 256
+netdepth_fine: 8
+netwidth_fine: 256
+N_rand: 2048
+first_frame_ray_in_batch: 0
+lrate: 0.01
+lrate_pose: 0.01
+pose_optimize_start: 0
+decay_rate: 0.1
+chunk: 99999999999
+netchunk: 6553600
+no_batching: 0
+amp: true
+
+N_samples: 128
+N_samples_around_depth: 128
+N_importance: 0
+N_importance_iter: 1
+perturb: 1
+use_viewdirs: 1
+i_embed: 1
+i_embed_views: 2
+multires: 8
+multires_views: 3
+feature_grid_dim: 2
+raw_noise_std: 0
+white_bkgd: 0
+gradient_max_norm: 0.1
+gradient_pose_max_norm: 0.1
+
+i_print: 100
+i_img: 500
+i_weights: 500
+i_mesh: 500
+i_nerf_normals: 500
+i_save_ray: 500
+i_pose: 500
+save_octree_clouds: True
+
+finest_res: 512
+base_res: 32
+num_levels: 16
+log2_hashmap_size: 22
+datadir: ''
+n_train_image: 300
+use_octree: 1
+first_frame_weight: 1            # 默认; 改 5 实测把场景拉向首帧 pose 偏置, 反而退步
+denoise_depth_use_octree_cloud: true
+octree_embed_base_voxel_size: 0.01
+octree_smallest_voxel_size: 0.01
+octree_raytracing_voxel_size: 0.01
+octree_dilate_size: 0.01
+down_scale_ratio: 1
+bounding_box: [[-1,-1,-1], [1,1,1]]
+farthest_pose_sampling: 0
+use_mask: 1
+dilate_mask_size: 0
+rays_valid_depth_only: true
+near: 0.1
+far: 2
+rgb_weight: 150            # ↑ from 100 (贴图监督权重; 200 没观察到额外收益)
+depth_weight: 0
+trunc: 0.005               # ↓ 5mm SDF 截断带
+trunc_start: 0.005
+sdf_lambda: 5
+neg_trunc_ratio: 1
+trunc_decay_type: ''
+sdf_loss_type: l2
+fs_weight: 100
+empty_weight: 1
+fs_rgb_weight: 0
+trunc_weight: 6000         # 默认; 实测 10000 与其它收紧叠加产生不稳, 不动这个
+sparse_loss_weight: 0
+tv_loss_weight: 0
+frame_features: 2
+optimize_poses: 1
+pose_reg_weight: 0
+point_cloud_loss_weight: 0
+point_cloud_loss_normal_weight: 0
+eikonal_weight: 0          # 不能开, 见文件头注释 (上游 render 没出 normals)
+normal_loss_weight: 0
+feature_reg_weight: 0.1
+deformation_reg_weight: 0
+use_deformation_field: 0
+max_pix_shift: 0.02
+share_coarse_fine: 1
+mode: sdf
+fs_sdf: 1
+crop: 0
+mesh_resolution: 0.001     # ↓ 1mm marching cubes 体素
+max_trans: 0.02
+max_rot: 10
+
+continual: True
+
+dbscan_eps: 0.005          # 5mm; 实测 0.003 切簇导致退步, 这是稳态点
+dbscan_eps_min_samples: 1
+
+sync_max_delay: 0
