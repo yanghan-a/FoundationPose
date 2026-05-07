@@ -61,6 +61,8 @@ python -m model_free_pipeline.pipeline reconstruct --out real_data/cube54 --ob_r
 python -m model_free_pipeline.pipeline reconstruct --out real_data/cube54 --recon_cfg model_free_pipeline/config_best.yml --plot  
 
 python -m model_free_pipeline.pipeline reconstruct --out real_data/cube54 --recon_cfg model_free_pipeline/config_best.yml --tex_res 2048 --plot
+
+python -m model_free_pipeline.pipeline reconstruct --out real_data/cube54 --recon_cfg model_free_pipeline/config_aggressive.yml --tex_res 2048 --max_frames 200 --plot
 ```
 NOF 训练 ~1k 步, 在 4060 Ti 上几分钟. 输出:
 ```

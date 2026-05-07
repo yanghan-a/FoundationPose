@@ -10,7 +10,7 @@ FoundationPose 单物体追踪 on Intel RealSense.
 用法:
 
 
-  python track_single.py --mesh_file demo_data/cube54/mesh/textured_cube54.obj --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6 --cam_width 640 --cam_height 480 --cam_fps 90 --score_vis_topk 5 --auto_bbox --debug 1
+  python track_single_publish.py --mesh_file demo_data/cube54/mesh/textured_cube54.obj --track_refine_iter 1 --color_exposure 5000 --depth_exposure 5000 --color_gain 80 --depth_max 0.6 --cam_width 640 --cam_height 480 --cam_fps 90 --score_vis_topk 5 --auto_bbox --debug 1
 
 
 按键:
@@ -27,11 +27,127 @@ tracking 阶段始终不写文件、不影响帧率.
 from estimater import *
 from datareader import *
 import argparse
+import json
 import re
 import time
 import threading
 from collections import defaultdict
 import pyrealsense2 as rs
+
+# AprilTag world frame + ZMQ publisher 依赖. 失败给明确安装提示而不是默认 ImportError.
+try:
+  from pupil_apriltags import Detector as AprilTagDetector
+except ImportError as e:
+  raise ImportError(
+      "pupil_apriltags not installed. Run: pip install pupil-apriltags") from e
+try:
+  import zmq
+except ImportError as e:
+  raise ImportError("pyzmq not installed. Run: pip install pyzmq") from e
+
+
+# ---------------------------------------------------------------------------
+# AprilTag 世界系: 启动采样 N 帧 + 固定; 复刻 cube_world_observer.py 的约定.
+# ---------------------------------------------------------------------------
+WORLD_TAG_ID = 0
+WORLD_TAG_SIZE = 0.048   # 米
+WORLD_SAMPLE_FRAMES = 100
+
+# WORLD_FRAME_CORRECTION = R_flip @ R_y(angle), 其中:
+#   R_flip = diag([1, -1, -1])  (绕 X 轴 180°, det=+1)
+#   R_y(angle) = palm→tag100 的 Y 轴补偿
+# 应用方式: avg_R = avg_R @ correction_R.T
+# 含义: correction_R 表达 "AprilTag 系 → 目标世界系" 的旋转, 右乘 .T 把
+#   world_in_cam 的旋转部分修正到目标轴系下, 之后 inv(world_in_cam) @ ob_in_cam
+#   出来就是物体在矫正后世界系下的 pose.
+PALM_TO_TAG100_Y_DEG = 10.0
+
+
+def _build_world_frame_correction(angle_deg):
+  """Build WORLD_FRAME_CORRECTION = R_flip @ R_y(angle).
+
+  Args:
+      angle_deg: Y-axis rotation in degrees (palm→tag100 compensation)
+
+  Returns:
+      3x3 proper rotation matrix (det=+1)
+  """
+  theta = np.radians(angle_deg)
+  c, s = np.cos(theta), np.sin(theta)
+  R_y = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+  R_flip = np.diag([1.0, -1.0, -1.0])
+  R = R_flip @ R_y
+  det = np.linalg.det(R)
+  assert abs(det - 1.0) < 1e-6, f"WORLD_FRAME_CORRECTION det={det:.6f}, expected +1"
+  return R
+
+
+WORLD_FRAME_CORRECTION = _build_world_frame_correction(PALM_TO_TAG100_Y_DEG)
+
+
+def _mat_to_quat_xyzw(R):
+  """Rotation matrix -> quaternion (x, y, z, w) via Shepperd's method.
+
+  Numerically stable across all branches; no scipy per-frame overhead.
+  """
+  trace = R[0, 0] + R[1, 1] + R[2, 2]
+  if trace > 0:
+    s = 0.5 / np.sqrt(trace + 1.0)
+    w = 0.25 / s
+    x = (R[2, 1] - R[1, 2]) * s
+    y = (R[0, 2] - R[2, 0]) * s
+    z = (R[1, 0] - R[0, 1]) * s
+  elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+    s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+    w = (R[2, 1] - R[1, 2]) / s
+    x = 0.25 * s
+    y = (R[0, 1] + R[1, 0]) / s
+    z = (R[0, 2] + R[2, 0]) / s
+  elif R[1, 1] > R[2, 2]:
+    s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+    w = (R[0, 2] - R[2, 0]) / s
+    x = (R[0, 1] + R[1, 0]) / s
+    y = 0.25 * s
+    z = (R[1, 2] + R[2, 1]) / s
+  else:
+    s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+    w = (R[1, 0] - R[0, 1]) / s
+    x = (R[0, 2] + R[2, 0]) / s
+    y = (R[1, 2] + R[2, 1]) / s
+    z = 0.25 * s
+  q = np.array([x, y, z, w])
+  q /= np.linalg.norm(q)
+  return q
+
+
+def _quat_to_euler_xyz_deg(q_xyzw):
+  """Quaternion (x,y,z,w) -> intrinsic XYZ Euler angles in degrees."""
+  x, y, z, w = q_xyzw
+  sinr_cosp = 2.0 * (w * x + y * z)
+  cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+  roll = np.arctan2(sinr_cosp, cosr_cosp)
+  sinp = 2.0 * (w * y - z * x)
+  sinp = np.clip(sinp, -1.0, 1.0)
+  pitch = np.arcsin(sinp)
+  siny_cosp = 2.0 * (w * z + x * y)
+  cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+  yaw = np.arctan2(siny_cosp, cosy_cosp)
+  return np.degrees(np.array([roll, pitch, yaw]))
+
+
+def _quat_average(quats):
+  """Hemisphere-aligned mean of unit quaternions, then normalize.
+
+  Avoids quaternion sign ambiguity (q == -q) by flipping any sample whose
+  dot product with the first sample is negative before averaging.
+  """
+  quats = np.array(quats, dtype=np.float64)
+  for i in range(1, len(quats)):
+    if np.dot(quats[i], quats[0]) < 0:
+      quats[i] = -quats[i]
+  q = quats.mean(axis=0)
+  q /= np.linalg.norm(q)
+  return q
 
 
 class FrameProfiler:
@@ -281,6 +397,150 @@ class BBoxSelector:
     return mask
 
 
+class WorldFrameSampler:
+  """启动时采样 N 帧 AprilTag pose, 四元数平均后固定一个 "world" 系.
+
+  约定:
+    world_pose = (R_world_in_cam, t_world_in_cam)
+      - R_world_in_cam: 世界三轴(列)在相机系下的方向
+      - t_world_in_cam: 世界原点在相机系下的位置(米)
+    transform 公式: ob_in_world = inv(world_in_cam) @ ob_in_cam.
+
+  矫正应用方式 (右乘 correction_R.T) 完全照搬 cube_world_observer.py:
+    correction_R 表达 "AprilTag 系 → 目标世界系" 的旋转,
+    avg_R = avg_R @ correction_R.T 就是把 world_in_cam 修正到目标轴系下.
+
+  接口:
+    start()                      重置采样状态(供 'w' 键调用)
+    step(rgb)  -> (detected, corners or None)
+                                 喂一帧彩图(RGB), 采样阶段累计 R/t,
+                                 满帧后 _finalize 设 self.world_pose 与 _fixed=True;
+                                 固定后是 no-op, 返回 (False, None).
+    transform(ob_in_cam)         4x4 -> 4x4 ob_in_world, world_pose=None 返回 None.
+  """
+
+  def __init__(self, K, tag_id=WORLD_TAG_ID, tag_size=WORLD_TAG_SIZE,
+               sample_target=WORLD_SAMPLE_FRAMES,
+               correction=WORLD_FRAME_CORRECTION,
+               quad_decimate=2.0):
+    self._fxfycxcy = (float(K[0, 0]), float(K[1, 1]),
+                      float(K[0, 2]), float(K[1, 2]))
+    self.tag_id = int(tag_id)
+    self.tag_size = float(tag_size)
+    self.sample_target = int(sample_target)
+    self.correction = correction
+    # quad_decimate=2.0: RealSense 640x480 比工业相机分辨率低, 比 cube_world_observer
+    # 用的 3.0 更稳, 又不至于慢到拖累采样阶段.
+    self.detector = AprilTagDetector(
+        families="tag36h11", nthreads=4, quad_decimate=quad_decimate,
+        quad_sigma=0.0, decode_sharpening=0.25)
+
+    self._samples_R = []
+    self._samples_t = []
+    self._fixed = False
+    self.world_pose = None      # (R_world_in_cam, t_world_in_cam) — 矫正后
+    self.world_pose_4x4 = None  # 同 world_pose 的 4x4 形式, 给 draw_xyz_axis 用
+    self._inv_cache = None      # 缓存 (R^T, -R^T @ t) 避免每帧重算
+
+  @property
+  def fixed(self):
+    return self._fixed
+
+  @property
+  def n_collected(self):
+    return len(self._samples_R)
+
+  def start(self):
+    self._samples_R = []
+    self._samples_t = []
+    self._fixed = False
+    self.world_pose = None
+    self.world_pose_4x4 = None
+    self._inv_cache = None
+
+  def step(self, rgb):
+    """喂一帧彩图(RGB). 固定后立即 no-op (返回 (False, None))."""
+    if self._fixed:
+      return False, None
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    results = self.detector.detect(
+        gray, estimate_tag_pose=True,
+        camera_params=self._fxfycxcy, tag_size=self.tag_size)
+    for r in results:
+      if r.tag_id == self.tag_id:
+        self._samples_R.append(np.asarray(r.pose_R, dtype=np.float64))
+        self._samples_t.append(np.asarray(r.pose_t, dtype=np.float64).flatten())
+        if len(self._samples_R) >= self.sample_target:
+          self._finalize()
+        return True, r.corners
+    return False, None
+
+  def _finalize(self):
+    if len(self._samples_R) < 10:
+      print(f"[world] _finalize: only {len(self._samples_R)} samples, "
+            f"not enough — keeping sampling state open")
+      self._samples_R = []
+      self._samples_t = []
+      return
+    quats = [_mat_to_quat_xyzw(R) for R in self._samples_R]
+    avg_q = _quat_average(quats)
+    avg_R = self._quat_to_mat(avg_q)
+    avg_t = np.mean(self._samples_t, axis=0)
+
+    if self.correction is not None:
+      avg_R = avg_R @ np.asarray(self.correction).T
+      print(f"[world] applied frame correction "
+            f"(det={np.linalg.det(self.correction):.3f})")
+
+    self.world_pose = (avg_R, avg_t)
+    # 4x4 形式预先建好, draw_xyz_axis 每帧直接复用, 避免每帧 np.eye+切片赋值.
+    self.world_pose_4x4 = np.eye(4)
+    self.world_pose_4x4[:3, :3] = avg_R
+    self.world_pose_4x4[:3, 3] = avg_t
+    R_T = avg_R.T
+    self._inv_cache = (R_T, -R_T @ avg_t)
+    self._fixed = True
+    print(f"[world] FIXED after {len(self._samples_R)} samples. "
+          f"Press 'w' to resample.")
+
+  @staticmethod
+  def _quat_to_mat(q_xyzw):
+    """xyzw 四元数 -> 3x3 旋转矩阵."""
+    x, y, z, w = q_xyzw
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array([
+        [1 - 2 * (yy + zz),     2 * (xy - wz),     2 * (xz + wy)],
+        [    2 * (xy + wz), 1 - 2 * (xx + zz),     2 * (yz - wx)],
+        [    2 * (xz - wy),     2 * (yz + wx), 1 - 2 * (xx + yy)],
+    ])
+
+  def transform(self, ob_in_cam):
+    """ob_in_cam (4x4) -> ob_in_world (4x4). 未固定返回 None."""
+    if self.world_pose is None or self._inv_cache is None:
+      return None
+    R_T, neg_R_T_t = self._inv_cache
+    ob_in_world = np.eye(4)
+    ob_in_world[:3, :3] = R_T @ ob_in_cam[:3, :3]
+    ob_in_world[:3, 3] = R_T @ ob_in_cam[:3, 3] + neg_R_T_t
+    return ob_in_world
+
+  def world_axes_in_cam(self, axis_length=0.05):
+    """世界三轴端点在相机系下的 4 个 3D 点 (origin + xyz_end), 用于可视化."""
+    if self.world_pose is None:
+      return None
+    R, t = self.world_pose
+    origin = t.reshape(3)
+    pts = np.stack([
+        origin,
+        origin + axis_length * R[:, 0],
+        origin + axis_length * R[:, 1],
+        origin + axis_length * R[:, 2],
+    ], axis=0)
+    return pts
+
+
 # register 完成后会在 debug_dir 留下这些中间产物, 我们只想留 vis_score.png,
 # 其余清理掉以保持目录干净.
 _REGISTER_INTERMEDIATE_FILES = [
@@ -403,6 +663,25 @@ def main():
   parser.add_argument('--auto_bbox', action='store_true',
                       help='跳过手动框选, 用画面中央 H/2 x W/2 的矩形作为初始 mask. '
                            '使用前把目标物体放在画面中央并距离相机适中.')
+  # AprilTag 世界系 + ZMQ 发布相关参数
+  parser.add_argument('--world_samples', type=int, default=WORLD_SAMPLE_FRAMES,
+                      help=f'AprilTag 启动采样帧数. 默认 {WORLD_SAMPLE_FRAMES}.')
+  parser.add_argument('--world_tag_id', type=int, default=WORLD_TAG_ID,
+                      help=f'AprilTag(tag36h11) 用作世界系的 tag id. 默认 {WORLD_TAG_ID}.')
+  parser.add_argument('--world_tag_size', type=float, default=WORLD_TAG_SIZE,
+                      help=f'AprilTag 物理边长(米). 默认 {WORLD_TAG_SIZE}.')
+  parser.add_argument('--world_correction_y_deg', type=float,
+                      default=PALM_TO_TAG100_Y_DEG,
+                      help=f'世界系矫正: 在 R_flip(绕X 180°)之前先绕 Y 旋转的角度(度). '
+                           f'默认 {PALM_TO_TAG100_Y_DEG} 是 cube_world_observer 在 MV 工业相机下'
+                           f'的标定值, RealSense 安装位姿不同的话先试 0 看 raw AprilTag 系再调.')
+  parser.add_argument('--no_world_correction', action='store_true',
+                      help='完全跳过世界系矫正, 直接用 AprilTag 系作为世界系. '
+                           '想先看 raw 朝向再决定要不要补角度时打开.')
+  parser.add_argument('--zmq_port', type=int, default=5555,
+                      help='ZMQ PUB 端口, 发布物体在 AprilTag 世界系下的 pose. 默认 5555.')
+  parser.add_argument('--no_zmq', action='store_true',
+                      help='关闭 ZMQ 发布, 仅做屏幕显示和 stdout 打印.')
   args = parser.parse_args()
 
   set_logging_format()
@@ -449,11 +728,39 @@ def main():
 
   selector = BBoxSelector()
 
+  # AprilTag 世界系采样器: 启动时采 N 帧固定, 之后每帧 step() 是 no-op.
+  if args.no_world_correction:
+    correction = None
+    print(f"[world] correction DISABLED (--no_world_correction), "
+          f"using raw AprilTag frame as world frame")
+  else:
+    correction = _build_world_frame_correction(args.world_correction_y_deg)
+    print(f"[world] correction = R_flip @ R_y({args.world_correction_y_deg:+.2f}°)")
+  sampler = WorldFrameSampler(K, tag_id=args.world_tag_id,
+                              tag_size=args.world_tag_size,
+                              sample_target=args.world_samples,
+                              correction=correction)
+  sampler.start()
+  print(f"[world] sampling enabled: tag36h11 id={args.world_tag_id} "
+        f"size={args.world_tag_size}m target={args.world_samples} frames")
+
+  # ZMQ PUB socket: 物体在世界系下的 pose 单向广播.
+  zmq_ctx = None
+  zmq_sock = None
+  if not args.no_zmq:
+    zmq_ctx = zmq.Context()
+    zmq_sock = zmq_ctx.socket(zmq.PUB)
+    zmq_sock.bind(f"tcp://*:{args.zmq_port}")
+    print(f"[zmq] PUB on tcp://*:{args.zmq_port}")
+  else:
+    print(f"[zmq] disabled (--no_zmq)")
+
   pose = None
   frame_id = 0
   need_register = True
   last_cam_id = -1
   register_bbox_2d = None    # (x1,y1,x2,y2) register 时 mask 的外接矩形, 用于可视化检查
+  last_world_xyz_log = 0.0   # 上次 stdout 打印 ob_in_world 的时间戳, 控制频率
 
   fps_window = []
   fps_window_size = 30
@@ -522,6 +829,11 @@ def main():
                              iteration=args.track_refine_iter,
                              profiler=profiler)
 
+      # 喂给 AprilTag 采样器 (固定后是 no-op), 然后把 ob_in_cam 转到世界系.
+      profiler.tick('world_sampler')
+      world_detected, world_corners = sampler.step(color)
+      ob_in_world = sampler.transform(pose)
+
       # 仅 debug>=1 才画轴和 bbox, 否则连这点开销都省 (debug=0 = 真静默最快)
       vis = None
       if debug >= 1:
@@ -529,6 +841,18 @@ def main():
         vis = draw_posed_3d_box(K, img=color, ob_in_cam=pose, bbox=bbox)
         vis = draw_xyz_axis(vis, ob_in_cam=pose, scale=0.05, K=K,
                             thickness=3, transparency=0, is_input_rgb=True)
+        # 已固定的世界轴: 在物体轴旁多画一组, 方便目视验证 ob_in_world 是否合理.
+        # 注意: 必须用 transparency=0 走 fast path. slow path 在 is_input_rgb=True
+        # 下会先 cvtColor RGB→BGR 再用 RGB 颜色元组直接画到 BGR 图上, 等于把 X 轴
+        # 画成蓝色、Z 轴画成红色 (Y 对称, 看起来正常), 视觉上像 R 没矫正过来。
+        # 同时 fast path 砍掉了 3 次 full-image diff 和 2 次 cvtColor, vis_render
+        # 从 ~15ms 降到 ~3ms。
+        # 用浅色区分世界轴和物体轴: 浅红 / 浅绿 / 浅蓝 (axis_colors 旁路 is_input_rgb).
+        if sampler.world_pose_4x4 is not None:
+          vis = draw_xyz_axis(
+              vis, ob_in_cam=sampler.world_pose_4x4, scale=0.05, K=K,
+              thickness=2, transparency=0, is_input_rgb=True,
+              axis_colors=((255, 140, 140), (140, 255, 140), (140, 140, 255)))
 
       t_now = time.time()
       fps_window.append(t_now)
@@ -541,6 +865,34 @@ def main():
         print(f"[fps] FPS={fps_smoothed:5.1f}  frame={frame_ms:5.1f}ms  id={frame_id}")
         last_print_t = t_now
 
+      # ob_in_world 周期 stdout 打印 (与 fps 节奏分离, 仅世界系固定后才打)
+      if ob_in_world is not None and t_now - last_world_xyz_log >= 1.0:
+        t = ob_in_world[:3, 3]
+        q = _mat_to_quat_xyzw(ob_in_world[:3, :3])
+        rpy = _quat_to_euler_xyz_deg(q)
+        print(f"[world] xyz=({t[0]:+.4f},{t[1]:+.4f},{t[2]:+.4f}) "
+              f"rpy=({rpy[0]:+6.1f},{rpy[1]:+6.1f},{rpy[2]:+6.1f}) "
+              f"quat_xyzw=({q[0]:+.4f},{q[1]:+.4f},{q[2]:+.4f},{q[3]:+.4f})")
+        last_world_xyz_log = t_now
+
+      # ZMQ 发布 ob_in_world (字段格式与 cube_world_observer.py 对齐, key 用 'cube1' 以匹配 CubeReceiver)
+      if zmq_sock is not None and ob_in_world is not None:
+        t = ob_in_world[:3, 3]
+        q = _mat_to_quat_xyzw(ob_in_world[:3, :3])
+        try:
+          zmq_sock.send_string(json.dumps({
+              'timestamp': time.time(),
+              'frame': frame_id,
+              'world_fixed': sampler.fixed,
+              'cube1': {
+                  'position': {'x': float(t[0]), 'y': float(t[1]), 'z': float(t[2])},
+                  'orientation': {'x': float(q[0]), 'y': float(q[1]),
+                                  'z': float(q[2]), 'w': float(q[3])},
+              },
+          }), zmq.NOBLOCK)
+        except zmq.Again:
+          pass
+
       if debug >= 1 and vis is not None and frame_id % args.show_every == 0:
         profiler.tick('imshow_waitkey')
         vis_bgr = vis[..., ::-1].copy()
@@ -552,7 +904,45 @@ def main():
                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(vis_bgr, f"FPS: {fps_smoothed:5.1f}  ({frame_ms:5.1f} ms)",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow('track_single (q=quit, r=re-register)', vis_bgr)
+
+        # 世界系状态行 + 进度条 / FIXED 文本
+        if not sampler.fixed:
+          n = sampler.n_collected
+          tgt = args.world_samples
+          progress = n / max(tgt, 1)
+          bar_w, bar_h, bar_x, bar_y = 200, 18, 10, 50
+          cv2.rectangle(vis_bgr, (bar_x, bar_y),
+                        (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+          cv2.rectangle(vis_bgr, (bar_x, bar_y),
+                        (bar_x + int(bar_w * progress), bar_y + bar_h),
+                        (0, 255, 255), -1)
+          cv2.rectangle(vis_bgr, (bar_x, bar_y),
+                        (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
+          cv2.putText(vis_bgr, f"World Sampling: {n}/{tgt}",
+                      (bar_x, bar_y + bar_h + 18),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+          if world_corners is not None:
+            cv2.polylines(vis_bgr,
+                          [np.asarray(world_corners).astype(int)],
+                          True, (255, 0, 255), 2)
+        else:
+          cv2.putText(vis_bgr, "WORLD FIXED", (10, 55),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+          if ob_in_world is not None:
+            t = ob_in_world[:3, 3]
+            q = _mat_to_quat_xyzw(ob_in_world[:3, :3])
+            rpy = _quat_to_euler_xyz_deg(q)
+            cv2.putText(vis_bgr,
+                        f"xyz=({t[0]:+.3f},{t[1]:+.3f},{t[2]:+.3f})",
+                        (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (255, 255, 255), 1)
+            cv2.putText(vis_bgr,
+                        f"rpy=({rpy[0]:+6.1f},{rpy[1]:+6.1f},{rpy[2]:+6.1f})",
+                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (255, 255, 255), 1)
+
+        cv2.imshow('track_single (q=quit, r=re-register, w=resample world)',
+                   vis_bgr)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
           profiler.frame_mark()
@@ -560,6 +950,11 @@ def main():
         if key == ord('r'):
           profiler.frame_mark()
           need_register = True
+          continue
+        if key == ord('w'):
+          sampler.start()
+          print("[world] resampling started — waving the AprilTag in view")
+          profiler.frame_mark()
           continue
 
       profiler.frame_mark()
@@ -577,6 +972,16 @@ def main():
   finally:
     cam.stop()
     cv2.destroyAllWindows()
+    if zmq_sock is not None:
+      try:
+        zmq_sock.close(linger=0)
+      except Exception:
+        pass
+    if zmq_ctx is not None:
+      try:
+        zmq_ctx.term()
+      except Exception:
+        pass
 
 
 if __name__ == '__main__':

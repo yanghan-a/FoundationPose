@@ -19,7 +19,7 @@
 # 训练时长: 4060 Ti 上 ~18-25 分钟.
 
 notes: 'aggressive: trunc 3mm + 10000 steps + finer octree; risk of instability'
-n_step: 10000
+n_step: 15000
 netdepth: 8
 netwidth: 256
 netdepth_fine: 8
